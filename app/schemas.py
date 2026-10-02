@@ -273,6 +273,98 @@ class DeliveryEvaluateOut(BaseModel):
     feasible: bool
 
 
+class ReconcileSourceIn(BaseModel):
+    """单个水源的实际注入量（非负整数升/小时；停运水源注入必须为 0，仍须列出）。"""
+
+    source_id: str = Field(min_length=1, description="水源节点编号")
+    injection: StrictInt = Field(ge=0, description="实际注入量（非负整数，升/小时）")
+
+    model_config = {"extra": "forbid"}
+
+
+class ReconcileSinkIn(BaseModel):
+    """单个用水点的实际取用量（非负整数升/小时；未取用按 0 申报，仍须列出）。"""
+
+    sink_id: str = Field(min_length=1, description="用水点节点编号")
+    withdrawal: StrictInt = Field(ge=0, description="实际取用量（非负整数，升/小时）")
+
+    model_config = {"extra": "forbid"}
+
+
+class ReconcilePipeIn(BaseModel):
+    """单条管段的双向共用容量与可为空的带符号读数。
+
+    读数以管段 from→to 为正（升/小时）；null 表示该管段缺报，由服务推断
+    全部可行解中的最小/最大流量。
+    """
+
+    pipe_id: str = Field(min_length=1, description="管段编号")
+    capacity: StrictInt = Field(
+        ge=0, description="双向共用容量（非负整数，升/小时）"
+    )
+    # 带符号读数允许负数（to→from 方向）；StrictInt 拒绝布尔/小数（非整数整体拒绝）
+    reading: StrictInt | None = Field(
+        default=None,
+        description="带符号流量计读数（from→to 为正）；null/缺省表示缺报",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class MeterReconcileIn(BaseModel):
+    """读数核对入参：已读版本 + 每个水源实际注入量 + 每个用水点实际取用量
+    + 覆盖全部管段的双向共用容量与可为空带符号读数。
+
+    三类编号均须完整覆盖当前管网（不多不少）、同类不得重复；
+    注入、取用、容量均为非负整数升/小时；读数为带符号整数或 null。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    sources: list[ReconcileSourceIn] = Field(
+        description="每个水源的实际注入量（须覆盖全部水源；空网为空列表）"
+    )
+    sinks: list[ReconcileSinkIn] = Field(
+        description="每个用水点的实际取用量（须覆盖全部用水点；空网为空列表）"
+    )
+    pipes: list[ReconcilePipeIn] = Field(
+        description="每条管段的双向共用容量与可为空带符号读数（须覆盖全部管段）"
+    )
+
+
+class ReconcileReasonOut(BaseModel):
+    code: str
+    message: str
+    pipe_id: str | None = None
+    node_id: str | None = None
+
+
+class MeterReadingRangeOut(BaseModel):
+    """单条缺报管段在全部可行解中的流量范围（带符号，from→to 为正）。"""
+
+    pipe_id: str
+    # 出参保留管段方向，便于调度员核对符号含义
+    from_: str = Field(serialization_alias="from")
+    to_: str = Field(serialization_alias="to")
+    min_flow: int
+    max_flow: int
+    # min_flow == max_flow：缺报读数可唯一确定
+    determinable: bool
+
+
+class MeterReconcileOut(BaseModel):
+    """读数核对结果：当前版本/版本是否匹配/是否一致/缺报管段可行流量范围。
+
+    consistent=false（无可行解或硬约束被违反）时 readings 恒为空列表，
+    原因见 reasons；版本过期不拒绝，仍按当前状态计算，仅 version_match=false。
+    """
+
+    version: int
+    version_match: bool
+    consistent: bool
+    readings: list[MeterReadingRangeOut]
+    reasons: list[ReconcileReasonOut]
+
+
 class EventOut(BaseModel):
     id: int
     version_before: int

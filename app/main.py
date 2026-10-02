@@ -13,6 +13,7 @@
 - POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
+- POST /api/meters/reconcile                           管段流量计读数核对（只读：一致性 + 缺报读数可行流量范围）
 
 状态回看（快照）：
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
@@ -36,6 +37,8 @@ from .planning import (
     evaluate_source_switch,
     recommend_plan,
     validate_delivery_request,
+    validate_reconcile_request,
+    reconcile_meters,
     validate_import,
     BLOCKING_ISSUE_CODES,
 )
@@ -46,6 +49,7 @@ from .schemas import (
     RestoreIn,
     SourceSwitchIn,
     DeliveryEvaluateIn,
+    MeterReconcileIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -56,6 +60,7 @@ from .schemas import (
     SourceSwitchPreviewOut,
     SourceSwitchOut,
     DeliveryEvaluateOut,
+    MeterReconcileOut,
     EventOut,
     SnapshotOut,
     SnapshotMetaOut,
@@ -67,6 +72,7 @@ from .serializers import (
     serialize_restore_preview,
     serialize_source_switch_preview,
     serialize_delivery,
+    serialize_reconcile,
     serialize_snapshot,
     serialize_snapshot_row,
     serialize_snapshot_diff,
@@ -90,7 +96,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -525,6 +531,53 @@ def evaluate_delivery_request(payload: DeliveryEvaluateIn):
         blocked_pipe_ids=blocked_pipe_ids,
     )
     return serialize_delivery(version, payload.version, result)
+
+
+# ---------------------------------------------------------------- 读数核对（只读）
+
+
+@app.post(
+    "/api/meters/reconcile",
+    response_model=MeterReconcileOut,
+    tags=["读数核对"],
+    summary="管段流量计读数核对：按当前状态校验一致性，并为缺报管段推断可行流量范围（只读）",
+)
+def reconcile_meter_readings(payload: MeterReconcileIn):
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        # 阻断口径与既有可达性 / 流量核算接口完全一致：已关闭阀门 + 待修复故障管段
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    injections = [(s.source_id, s.injection) for s in payload.sources]
+    withdrawals = [(d.sink_id, d.withdrawal) for d in payload.sinks]
+    pipe_readings = [(p.pipe_id, p.capacity, p.reading) for p in payload.pipes]
+
+    issues = validate_reconcile_request(
+        nodes, pipes, injections, withdrawals, pipe_readings
+    )
+    if issues:
+        raise ApiError(
+            422,
+            "METER_RECONCILE_INVALID",
+            "读数核对请求非法（编号未覆盖当前管网、同类重复、未知节点或用水点类型错误）",
+            issues=issues,
+        )
+
+    blocked_pipe_ids = frozenset(
+        p.id for p in pipes.values() if p.has_valve and p.valve_closed
+    ) | pending_fault_ids
+
+    result = reconcile_meters(
+        nodes,
+        pipes,
+        injections,
+        withdrawals,
+        pipe_readings,
+        blocked_pipe_ids=blocked_pipe_ids,
+    )
+    return serialize_reconcile(version, payload.version, pipes, result)
 
 
 # ---------------------------------------------------------------- 状态快照回看

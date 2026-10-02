@@ -7,6 +7,7 @@ from .planning import (
     RestoreResult,
     SourceSwitchResult,
     DeliveryResult,
+    ReconcileResult,
 )
 
 def serialize_node(node: Node) -> dict:
@@ -119,6 +120,31 @@ def serialize_delivery(
         "total_demand": result.total_demand,
         "max_delivered_total": result.max_delivered_total,
         "feasible": result.feasible,
+    }
+
+
+def serialize_reconcile(
+    version: int,
+    expected_version: int,
+    pipes: dict[str, Pipe],
+    result: ReconcileResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "consistent": result.consistent,
+        "readings": [
+            {
+                "pipe_id": r.pipe_id,
+                "from_": pipes[r.pipe_id].from_node,
+                "to_": pipes[r.pipe_id].to_node,
+                "min_flow": r.min_flow,
+                "max_flow": r.max_flow,
+                "determinable": r.determinable,
+            }
+            for r in result.readings
+        ],
+        "reasons": [reason.as_dict() for reason in result.reasons],
     }
 
 

@@ -173,6 +173,38 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   （`feasible = max_delivered_total == total_demand`）；
   过期版本**不拒绝**：仍按当前状态核算，仅 `version_match=false`（与预演类接口一致）。
 
+**读数核对**（`POST /api/meters/reconcile`，**只读**，不改阀位/水源状态/事件/版本/快照）：
+
+- 调度员核对一批管段流量计读数，并在表计**缺报**时判断其可推断范围。入参为已读
+  `version` + **每个水源**的实际注入量 `sources` + **每个用水点**的实际取用量
+  `sinks` + **每条管段**的双向共用容量与可为空带符号读数 `pipes`；
+  注入、取用、容量均为**非负整数升/小时**（布尔/小数/负数按类型或数值错误处理），
+  读数为带符号整数或 `null`：以管段导入方向 **`from→to` 为正**，`null`（或缺省）表示该管段缺报。
+- 编号规则（任一不满足即整体拒绝，`422 METER_RECONCILE_INVALID`，返回全部问题明细）：
+  水源、用水点、管段编号均须**完整覆盖当前管网**（不多不少）、同类不重复；
+  水源编号必须是 source、用水点编号必须是 sink。问题代码分别为
+  `RECONCILE_SOURCE_MISSING/NOT_FOUND/DUPLICATE`、
+  `RECONCILE_SINK_MISSING/NOT_FOUND/NOT_SINK/DUPLICATE`、
+  `RECONCILE_PIPE_MISSING/NOT_FOUND/DUPLICATE`。
+- 按**当前水源运行状态、关阀与待修复故障**核对四条硬约束：
+  - **停运水源注入必须为 0**：否则 `STOPPED_SOURCE_INJECTION`（含水源编号）；
+  - **阻断管段流量必须为 0**：已关闭阀门与待修复(open)故障管段（与可达性/流量核算
+    同口径）读数非 0 即 `BLOCKED_PIPE_FLOW`（含管段编号）；
+  - **节点平衡**：每个节点 `流入 + 注入 = 流出 + 取用`；
+  - **容量约束**：管段净流量绝对值不得超过双向共用容量，已申报读数超限即
+    `READING_OVER_CAPACITY`（含管段编号）。
+- 可行解用**整数有向弧下界可行流**（Dinic + 超级源/汇）求解；无可行解时
+  `consistent=false`、`reasons=[{code:"READINGS_INCONSISTENT",...}]`，且
+  **不输出任何补值**（`readings=[]`）。
+- 对**缺报管段**，在剔除该弧的残量网络上以两次最大流（环流可增/可减量）求全部
+  可行整数解中的**最小/最大流量**：返回 `pipe_id`、方向回显 `from`/`to`、
+  `min_flow`、`max_flow` 与 `determinable`（`min_flow == max_flow` 时可确定）。
+  阻断管段或容量 0 的管段缺报时恒返回 `min_flow=max_flow=0`；已申报读数不在补值
+  列表中返回。
+- 过期版本**不拒绝**：仍按当前状态计算，仅 `version_match=false`。
+- 该接口为纯只读新增，**原有流量核算接口 `/api/delivery/evaluate` 的语义与返回
+  保持不变**（内部新增可复用的 Dinic 类，既有 `_undirected_max_flow` 未改动）。
+
 **状态快照（操作后回看）**（只增不改，编号由数据库序列全局单调分配，**不可复用**）：
 
 - 仅四类**实际改变状态**的写操作产生快照，且与状态变更在**同一事务**内冻结：
@@ -213,6 +245,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/sources/switch/preview` | 水源停运/恢复预演（只读：失供/恢复用水点、待修复故障重新进水风险） |
 | POST | `/api/sources/switch` | 水源停运/恢复确认（锁版本复核 + 原子更新水源状态） |
 | POST | `/api/delivery/evaluate` | 用水点最低流量核算（只读：现有阀位/故障下的最大可交付总量，整数最大流） |
+| POST | `/api/meters/reconcile` | 管段流量计读数核对（只读：一致性校验 + 缺报管段可行流量最小/最大值，整数有界可行流） |
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
 | GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
 | GET | `/api/snapshots/{snapshot_id}/diff?base_id=` | 相邻快照六类净变化对照（缺省对照上一条；首条无基线全计为新增） |
@@ -815,6 +848,91 @@ python3 examples/delivery_demo.py http://localhost:8000
 水源上限不足 → 隔离关阀后故障片区断供 / 只申报可达用水点即可满足 →
 编号未覆盖/重复/类型错误的 422 拒绝 → 确认版本、阀位与事件全程未被改写。
 
+### 12. 管段流量计读数核对（只读，缺报推断）
+
+调度员携带已读版本、每个水源的**实际注入量**、每个用水点的**实际取用量**、
+覆盖全部管段的**双向共用容量**与可为空的**带符号读数**（`from→to` 为正，升/小时），
+按当前水源运行状态、关阀与待修复故障核对一致性；`reading` 传 `null` 表示该表缺报，
+服务返回它在全部可行解中的最小/最大流量（**只读**，不改任何状态）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/meters/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "sources": [{"source_id": "S", "injection": 30}],
+    "sinks": [
+      {"sink_id": "U1", "withdrawal": 10},
+      {"sink_id": "U2", "withdrawal": 10},
+      {"sink_id": "U3", "withdrawal": 10}
+    ],
+    "pipes": [
+      {"pipe_id": "P1", "capacity": 100, "reading": null},
+      {"pipe_id": "P2", "capacity": 100, "reading": null},
+      {"pipe_id": "P3", "capacity": 100, "reading": null},
+      {"pipe_id": "P4", "capacity": 100, "reading": null},
+      {"pipe_id": "P5", "capacity": 100, "reading": null},
+      {"pipe_id": "P6", "capacity": 100, "reading": null}
+    ]
+  }'
+```
+
+树形管网下节点平衡把每条缺报管段唯一确定（`determinable=true`），并回显方向：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "consistent": true,
+  "readings": [
+    {"pipe_id": "P1", "from": "S", "to": "A", "min_flow": 30, "max_flow": 30, "determinable": true},
+    {"pipe_id": "P2", "from": "A", "to": "B", "min_flow": 20, "max_flow": 20, "determinable": true},
+    {"pipe_id": "P3", "from": "A", "to": "U1", "min_flow": 10, "max_flow": 10, "determinable": true},
+    {"pipe_id": "P4", "from": "B", "to": "D", "min_flow": 20, "max_flow": 20, "determinable": true},
+    {"pipe_id": "P5", "from": "B", "to": "U2", "min_flow": 10, "max_flow": 10, "determinable": true},
+    {"pipe_id": "P6", "from": "D", "to": "U3", "min_flow": 10, "max_flow": 10, "determinable": true}
+  ],
+  "reasons": []
+}
+```
+
+存在并联路径时缺报读数只能给出范围。例如 S→U 两条并联管段容量各 10、总流量 2：
+
+```json
+{"pipe_id": "Q1", "from": "S", "to": "U", "min_flow": -8, "max_flow": 10, "determinable": false}
+```
+
+本轮用法要点：
+
+- `sources` / `sinks` / `pipes` 均须**逐一覆盖当前管网**（停运水源、各用水点——
+  包括取用量为 0 的点——以及关阀/故障管段都仍须列出）；已申报读数的管段与缺报
+  管段混在同一 `pipes` 列表，用 `reading` 是否为 `null` 区分。
+- 读数以**导入管段的 `from→to` 为正**：负读数表示实际水流方向为 `to→from`；
+  响应中每条范围也回显 `from`/`to`，避免符号歧义。
+- 停运水源注入非 0（`STOPPED_SOURCE_INJECTION`）、关阀/待修复故障管段读数非 0
+  （`BLOCKED_PIPE_FLOW`）、读数绝对值超过容量（`READING_OVER_CAPACITY`）、
+  或整体平衡/容量无可行解（`READINGS_INCONSISTENT`）时 `consistent=false`，
+  原因在 `reasons`（含 `pipe_id` / `node_id`），且 **`readings` 恒为空、不补值**。
+- 用过期版本（如 `"version": 99`）调用不报错，仍按当前状态核对，
+  仅 `version_match=false`。
+- 编号覆盖不足/重复/未知节点（含把连接点当水源/用水点）、注入/取用/容量为
+  布尔/小数/负数、读数为小数等均 `422 METER_RECONCILE_INVALID` 整体拒绝，
+  明细在 `error.issues`。
+
+读数核对全流程演示脚本（标准库实现，全程只读）：
+
+```bash
+python3 examples/meter_reconcile_demo.py
+# 或指定地址：
+python3 examples/meter_reconcile_demo.py http://localhost:8000
+```
+
+脚本依次演示：全部缺报由平衡唯一确定 → 部分缺报/部分已报 → 读数不一致不补值 →
+读数超容量 → 隔离关阀与待修复故障管段阻断（缺报确定为 0、非零读数拒绝）→
+停运水源注入非 0 拒绝 → 过期版本仍按当前状态核对 →
+编号未覆盖/重复/未知节点与类型错误的 422 拒绝 → 确认版本、阀位、水源状态与事件
+全程未被改写。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -843,13 +961,13 @@ python3 examples/source_switch_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，66 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，81 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，68 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，79 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、读数核对（一致性/缺报范围/硬约束/422）、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -862,7 +980,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、状态快照冻结与相邻对照
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、状态快照冻结与相邻对照
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
@@ -875,6 +993,7 @@ examples/
   recommend_demo.py       # 关阀建议全流程示例
   source_switch_demo.py   # 水源停运/恢复全流程示例
   delivery_demo.py        # 用水点最低流量核算全流程示例（只读：水源/管段上限、瓶颈、停运/关阀阻断）
+  meter_reconcile_demo.py # 管段流量计读数核对全流程示例（只读：一致性、缺报范围、停运/关阀/故障硬约束、422）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
 tests/
   test_planning.py

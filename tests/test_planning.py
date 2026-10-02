@@ -20,6 +20,8 @@ from app.planning import (  # noqa: E402
     reachable_sink_ids,
     recommend_plan,
     validate_delivery_request,
+    validate_reconcile_request,
+    reconcile_meters,
     validate_import,
     _undirected_max_flow,
     DUPLICATE_NODE_ID,
@@ -1009,6 +1011,246 @@ class DeliveryMaxFlowTests(unittest.TestCase):
             [("U1", 100), ("U2", 100)],
         )
         self.assertEqual(flow, 5)
+
+
+# ---------------------------------------------------------------- 读数核对
+
+
+def build_reconcile_demo():
+    """单水源分支管网：
+
+    S --P1-- A --P2-- B --P4-- U2
+              |
+             P3
+              |
+             U1
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "B": Node("B", "junction"),
+        "U1": Node("U1", "sink"),
+        "U2": Node("U2", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A"),
+        "P2": Pipe("P2", "A", "B"),
+        "P3": Pipe("P3", "A", "U1"),
+        "P4": Pipe("P4", "B", "U2"),
+    }
+    return nodes, pipes
+
+
+class ReconcileValidationTests(unittest.TestCase):
+    def _full(self, nodes, pipes):
+        injections = [(nid, 1) for nid, n in nodes.items() if n.type == "source"]
+        withdrawals = [(nid, 1) for nid, n in nodes.items() if n.type == "sink"]
+        readings = [(pid, 10, None) for pid in pipes]
+        return injections, withdrawals, readings
+
+    def test_valid_request_no_issues(self):
+        nodes, pipes = build_reconcile_demo()
+        injections, withdrawals, readings = self._full(nodes, pipes)
+        issues = validate_reconcile_request(
+            nodes, pipes, injections, withdrawals, readings
+        )
+        self.assertEqual(issues, [])
+
+    def test_coverage_and_duplicates(self):
+        nodes, pipes = build_reconcile_demo()
+        # 缺水源 S / 缺水点 U2 / 缺管段 P3 + 各自编号重复 / 不存在 / 类型错误
+        issues = validate_reconcile_request(
+            nodes,
+            pipes,
+            [("SX", 1), ("SX", 1)],
+            [("U1", 1), ("U1", 1), ("A", 1)],
+            [("P1", 10, None), ("P1", 10, None), ("PX", 10, None)],
+        )
+        codes = {i.code for i in issues}
+        self.assertIn("RECONCILE_SOURCE_NOT_FOUND", codes)
+        self.assertIn("RECONCILE_SOURCE_DUPLICATE", codes)
+        self.assertIn("RECONCILE_SOURCE_MISSING", codes)
+        self.assertIn("RECONCILE_SINK_DUPLICATE", codes)
+        self.assertIn("RECONCILE_SINK_NOT_SINK", codes)
+        self.assertIn("RECONCILE_SINK_MISSING", codes)
+        self.assertIn("RECONCILE_PIPE_DUPLICATE", codes)
+        self.assertIn("RECONCILE_PIPE_NOT_FOUND", codes)
+        self.assertIn("RECONCILE_PIPE_MISSING", codes)
+
+    def test_sink_not_found(self):
+        nodes, pipes = build_reconcile_demo()
+        injections = [("S", 1)]
+        withdrawals = [("U1", 1), ("U2", 0), ("UX", 1)]
+        readings = [(pid, 10, None) for pid in pipes]
+        issues = validate_reconcile_request(
+            nodes, pipes, injections, withdrawals, readings
+        )
+        self.assertIn("RECONCILE_SINK_NOT_FOUND", {i.code for i in issues})
+
+
+class ReconcileMetersTests(unittest.TestCase):
+    def test_all_reported_consistent(self):
+        nodes, pipes = build_reconcile_demo()
+        # S 注入 3：U1 取 1、U2 取 2
+        readings = [
+            ("P1", 10, 3),
+            ("P2", 10, 2),
+            ("P3", 10, 1),
+            ("P4", 10, 2),
+        ]
+        result = reconcile_meters(
+            nodes, pipes,
+            [("S", 3)], [("U1", 1), ("U2", 2)], readings,
+        )
+        self.assertTrue(result.consistent, result.reasons)
+        # 无缺报管段
+        self.assertEqual(result.readings, [])
+        self.assertEqual(result.reasons, [])
+
+    def test_missing_pipe_ranges_branch(self):
+        nodes, pipes = build_reconcile_demo()
+        # 注入=取用=0：停运态全网零流，缺报全部可确定为 0
+        result = reconcile_meters(
+            nodes, pipes,
+            [("S", 0)], [("U1", 0), ("U2", 0)],
+            [(pid, 10, None) for pid in pipes],
+        )
+        self.assertTrue(result.consistent)
+        self.assertEqual({r.pipe_id for r in result.readings}, set(pipes))
+        for r in result.readings:
+            self.assertEqual((r.min_flow, r.max_flow), (0, 0))
+            self.assertTrue(r.determinable)
+
+    def test_missing_downstream_determined_by_demand(self):
+        nodes, pipes = build_reconcile_demo()
+        # S 注入 3、U1 取 1、U2 取 2：P1/P3/P4 由平衡唯一确定，P2 同为 2
+        result = reconcile_meters(
+            nodes, pipes,
+            [("S", 3)], [("U1", 1), ("U2", 2)],
+            [(pid, 10, None) for pid in pipes],
+        )
+        self.assertTrue(result.consistent, result.reasons)
+        got = {r.pipe_id: (r.min_flow, r.max_flow) for r in result.readings}
+        self.assertEqual(got, {"P1": (3, 3), "P2": (2, 2), "P3": (1, 1), "P4": (2, 2)})
+        self.assertTrue(all(r.determinable for r in result.readings))
+
+    def test_indeterminate_range_in_loop(self):
+        # 双路径环网：S 注入 2，U 取 2，两并联管段容量均为 10
+        nodes = {"S": Node("S", "source"), "U": Node("U", "sink")}
+        pipes = {
+            "Q1": Pipe("Q1", "S", "U"),
+            "Q2": Pipe("Q2", "S", "U"),
+        }
+        result = reconcile_meters(
+            nodes, pipes,
+            [("S", 2)], [("U", 2)],
+            [("Q1", 10, None), ("Q2", 10, None)],
+        )
+        self.assertTrue(result.consistent)
+        got = {r.pipe_id: (r.min_flow, r.max_flow) for r in result.readings}
+        # f1+f2=2，各可在 [-8,10] 内分担
+        self.assertEqual(got, {"Q1": (-8, 10), "Q2": (-8, 10)})
+        self.assertFalse(any(r.determinable for r in result.readings))
+
+    def test_partial_reading_plus_missing_range(self):
+        nodes = {"S": Node("S", "source"), "U": Node("U", "sink")}
+        pipes = {"Q1": Pipe("Q1", "S", "U"), "Q2": Pipe("Q2", "S", "U")}
+        # Q1 已报 3，则 Q2 缺报被唯一确定为 1
+        result = reconcile_meters(
+            nodes, pipes,
+            [("S", 4)], [("U", 4)],
+            [("Q1", 10, 3), ("Q2", 10, None)],
+        )
+        self.assertTrue(result.consistent)
+        self.assertEqual(len(result.readings), 1)
+        self.assertEqual(result.readings[0].pipe_id, "Q2")
+        self.assertEqual((result.readings[0].min_flow, result.readings[0].max_flow), (1, 1))
+        self.assertTrue(result.readings[0].determinable)
+
+    def test_report_violates_balance_inconsistent(self):
+        nodes, pipes = build_reconcile_demo()
+        # P1 报 0，但 S 注入 3：无可行解，且不输出补值
+        readings = [
+            ("P1", 10, 0), ("P2", 10, None), ("P3", 10, None), ("P4", 10, None),
+        ]
+        result = reconcile_meters(
+            nodes, pipes,
+            [("S", 3)], [("U1", 1), ("U2", 2)], readings,
+        )
+        self.assertFalse(result.consistent)
+        self.assertEqual(result.readings, [])
+        self.assertEqual(result.reasons[0].code, "READINGS_INCONSISTENT")
+
+    def test_total_mismatch_inconsistent(self):
+        nodes, pipes = build_reconcile_demo()
+        result = reconcile_meters(
+            nodes, pipes,
+            [("S", 3)], [("U1", 1), ("U2", 1)],
+            [(pid, 10, None) for pid in pipes],
+        )
+        self.assertFalse(result.consistent)
+        self.assertEqual(result.reasons[0].code, "READINGS_INCONSISTENT")
+
+    def test_stopped_source_injection_must_be_zero(self):
+        nodes = {
+            "S": Node("S", "source", running=False),
+            "U": Node("U", "sink"),
+        }
+        pipes = {"P1": Pipe("P1", "S", "U")}
+        result = reconcile_meters(
+            nodes, pipes, [("S", 1)], [("U", 1)], [("P1", 10, 1)]
+        )
+        self.assertFalse(result.consistent)
+        self.assertEqual(result.reasons[0].code, "STOPPED_SOURCE_INJECTION")
+        # 停运且注入 0、取用 0：一致，缺报 P1 确定为 0
+        result = reconcile_meters(
+            nodes, pipes, [("S", 0)], [("U", 0)], [("P1", 10, None)]
+        )
+        self.assertTrue(result.consistent)
+        self.assertEqual((result.readings[0].min_flow, result.readings[0].max_flow), (0, 0))
+
+    def test_blocked_pipe_flow_must_be_zero(self):
+        nodes = {"S": Node("S", "source"), "U": Node("U", "sink")}
+        pipes = {"P1": Pipe("P1", "S", "U", has_valve=True, valve_closed=True)}
+        # 阻断管段有非零读数
+        result = reconcile_meters(
+            nodes, pipes, [("S", 0)], [("U", 0)], [("P1", 10, 1)],
+            blocked_pipe_ids=frozenset(["P1"]),
+        )
+        self.assertFalse(result.consistent)
+        self.assertEqual(result.reasons[0].code, "BLOCKED_PIPE_FLOW")
+        # 阻断管段缺报：可确定为 0
+        result = reconcile_meters(
+            nodes, pipes, [("S", 0)], [("U", 0)], [("P1", 10, None)],
+            blocked_pipe_ids=frozenset(["P1"]),
+        )
+        self.assertTrue(result.consistent)
+        self.assertEqual(result.readings[0].pipe_id, "P1")
+        self.assertTrue(result.readings[0].determinable)
+        self.assertEqual(result.readings[0].min_flow, 0)
+
+    def test_reading_over_capacity(self):
+        nodes = {"S": Node("S", "source"), "U": Node("U", "sink")}
+        pipes = {"P1": Pipe("P1", "S", "U")}
+        result = reconcile_meters(
+            nodes, pipes, [("S", 5)], [("U", 5)], [("P1", 4, -5)]
+        )
+        self.assertFalse(result.consistent)
+        self.assertEqual(result.reasons[0].code, "READING_OVER_CAPACITY")
+
+    def test_zero_capacity_missing_is_zero(self):
+        nodes = {"S": Node("S", "source"), "U": Node("U", "sink")}
+        pipes = {"P1": Pipe("P1", "S", "U")}
+        result = reconcile_meters(
+            nodes, pipes, [("S", 0)], [("U", 0)], [("P1", 0, None)]
+        )
+        self.assertTrue(result.consistent)
+        self.assertEqual((result.readings[0].min_flow, result.readings[0].max_flow), (0, 0))
+
+    def test_empty_network(self):
+        result = reconcile_meters({}, {}, [], [], [])
+        self.assertTrue(result.consistent)
+        self.assertEqual(result.readings, [])
 
 
 if __name__ == "__main__":

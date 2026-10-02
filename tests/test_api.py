@@ -1797,5 +1797,316 @@ class DeliveryApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/isolation/events").json(), [])
 
 
+def _reconcile_body(
+    version=1,
+    *,
+    injections=None,
+    withdrawals=None,
+    pipe_entries=None,
+):
+    # VALID_NETWORK：S；U1/U2/U3；P1..P6
+    return {
+        "version": version,
+        "sources": [
+            {"source_id": sid, "injection": inj}
+            for sid, inj in (injections if injections is not None else [("S", 0)])
+        ],
+        "sinks": [
+            {"sink_id": sid, "withdrawal": wd}
+            for sid, wd in (
+                withdrawals
+                if withdrawals is not None
+                else [("U1", 0), ("U2", 0), ("U3", 0)]
+            )
+        ],
+        "pipes": [
+            {"pipe_id": pid, "capacity": cap, "reading": reading}
+            for pid, cap, reading in (
+                pipe_entries
+                if pipe_entries is not None
+                else [(pid, 100, None) for pid in ("P1", "P2", "P3", "P4", "P5", "P6")]
+            )
+        ],
+    }
+
+
+class MeterReconcileApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.fail_commit = False
+
+    def _import(self, network=VALID_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_all_reported_consistent(self):
+        self._import()
+        body = _reconcile_body(
+            injections=[("S", 30)],
+            withdrawals=[("U1", 10), ("U2", 10), ("U3", 10)],
+            pipe_entries=[
+                ("P1", 100, 30), ("P2", 100, 20), ("P3", 100, 10),
+                ("P4", 100, 20), ("P5", 100, 10), ("P6", 100, 10),
+            ],
+        )
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        self.assertEqual(out["readings"], [])
+        self.assertEqual(out["reasons"], [])
+        self.assertTrue(out["version_match"])
+        self.assertEqual(out["version"], 1)
+
+    def test_missing_ranges_all_determined_by_balance(self):
+        self._import()
+        # 全部缺报：S 注入 30，各点取用 10，树形管网各管段被唯一确定
+        body = _reconcile_body(
+            injections=[("S", 30)],
+            withdrawals=[("U1", 10), ("U2", 10), ("U3", 10)],
+        )
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        got = {x["pipe_id"]: x for x in out["readings"]}
+        # 方向回显与 VALID_NETWORK 一致
+        self.assertEqual(got["P1"]["from"], "S")
+        self.assertEqual(got["P1"]["to"], "A")
+        self.assertEqual(
+            {pid: (v["min_flow"], v["max_flow"]) for pid, v in got.items()},
+            {"P1": (30, 30), "P2": (20, 20), "P3": (10, 10),
+             "P4": (20, 20), "P5": (10, 10), "P6": (10, 10)},
+        )
+        self.assertTrue(all(v["determinable"] for v in got.values()))
+
+    def test_indeterminate_range(self):
+        # 并联双管：S ->(Q1/Q2)-> U，总流量 2，缺报两管按容量自由分担
+        network = {
+            "nodes": [
+                {"id": "S", "type": "source"},
+                {"id": "U", "type": "sink"},
+            ],
+            "pipes": [
+                {"id": "Q1", "from": "S", "to": "U", "has_valve": True},
+                {"id": "Q2", "from": "S", "to": "U", "has_valve": True},
+            ],
+        }
+        self._import(network)
+        body = {
+            "version": 1,
+            "sources": [{"source_id": "S", "injection": 2}],
+            "sinks": [{"sink_id": "U", "withdrawal": 2}],
+            "pipes": [
+                {"pipe_id": "Q1", "capacity": 10, "reading": None},
+                {"pipe_id": "Q2", "capacity": 10, "reading": None},
+            ],
+        }
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        got = {x["pipe_id"]: x for x in out["readings"]}
+        # f1+f2=2，f1∈[-8,10]（f2 随之反向分担）
+        for x in got.values():
+            self.assertEqual((x["min_flow"], x["max_flow"]), (-8, 10))
+            self.assertFalse(x["determinable"])
+
+        # 补报 Q1=3 后，Q2 缺报被唯一确定为 -1（即实际 U->S 方向 1，与 Q1 抵消 1）
+        body["pipes"][0]["reading"] = 3
+        r = self.client.post("/api/meters/reconcile", json=body)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        only = out["readings"]
+        self.assertEqual(len(only), 1)
+        self.assertEqual(only[0]["pipe_id"], "Q2")
+        self.assertEqual((only[0]["min_flow"], only[0]["max_flow"]), (-1, -1))
+        self.assertTrue(only[0]["determinable"])
+
+    def test_inconsistent_returns_no_supplement(self):
+        self._import()
+        # P1 报 0 但 S 注入 30：平衡不可满足
+        body = _reconcile_body(
+            injections=[("S", 30)],
+            withdrawals=[("U1", 10), ("U2", 10), ("U3", 10)],
+            pipe_entries=[
+                ("P1", 100, 0), ("P2", 100, None), ("P3", 100, None),
+                ("P4", 100, None), ("P5", 100, None), ("P6", 100, None),
+            ],
+        )
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200)
+        out = r.json()
+        self.assertFalse(out["consistent"])
+        self.assertEqual(out["readings"], [])
+        self.assertEqual(out["reasons"][0]["code"], "READINGS_INCONSISTENT")
+
+    def test_stopped_source_and_blocked_pipe_hard_constraints(self):
+        self._import(TWO_SOURCE_NETWORK)
+        # 停运 S1 却申报注入 5
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 1},
+        )
+        body = {
+            "version": 2,
+            "sources": [{"source_id": "S1", "injection": 5},
+                        {"source_id": "S2", "injection": 0}],
+            "sinks": [{"sink_id": "U1", "withdrawal": 0},
+                      {"sink_id": "U2", "withdrawal": 5}],
+            "pipes": [
+                {"pipe_id": "Q1", "capacity": 10, "reading": 5},
+                {"pipe_id": "Q3", "capacity": 10, "reading": 0},
+                {"pipe_id": "Q2", "capacity": 10, "reading": 0},
+                {"pipe_id": "Q4", "capacity": 10, "reading": 5},
+            ],
+        }
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200)
+        out = r.json()
+        self.assertFalse(out["consistent"])
+        self.assertEqual(out["reasons"][0]["code"], "STOPPED_SOURCE_INJECTION")
+        self.assertEqual(out["reasons"][0]["node_id"], "S1")
+
+        # 关阀阻断：隔离 P6 关 P4 后，P4 读数非 0 -> BLOCKED_PIPE_FLOW
+        self._import()
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        body = _reconcile_body(
+            version=2,
+            injections=[("S", 0)],
+            withdrawals=[("U1", 0), ("U2", 0), ("U3", 0)],
+            pipe_entries=[
+                ("P1", 100, 0), ("P2", 100, 0), ("P3", 100, 0),
+                ("P4", 100, 3), ("P5", 100, 0), ("P6", 100, 0),
+            ],
+        )
+        r = self.client.post("/api/meters/reconcile", json=body)
+        out = r.json()
+        self.assertFalse(out["consistent"])
+        self.assertEqual(out["reasons"][0]["code"], "BLOCKED_PIPE_FLOW")
+        self.assertEqual(out["reasons"][0]["pipe_id"], "P4")
+        # P6 待修复故障管段同样阻断（读数 0 即一致，缺报也可确定为 0）
+        body["pipes"][3]["reading"] = 0
+        body["pipes"][5]["reading"] = None
+        r = self.client.post("/api/meters/reconcile", json=body)
+        out = r.json()
+        self.assertTrue(out["consistent"], out)
+        p6 = [x for x in out["readings"] if x["pipe_id"] == "P6"][0]
+        self.assertEqual((p6["min_flow"], p6["max_flow"]), (0, 0))
+
+    def test_reading_over_capacity(self):
+        self._import()
+        body = _reconcile_body(
+            injections=[("S", 0)],
+            withdrawals=[("U1", 0), ("U2", 0), ("U3", 0)],
+            pipe_entries=[
+                ("P1", 5, 6), ("P2", 100, 0), ("P3", 100, 0),
+                ("P4", 100, 0), ("P5", 100, 0), ("P6", 100, 0),
+            ],
+        )
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertFalse(r.json()["consistent"])
+        self.assertEqual(r.json()["reasons"][0]["code"], "READING_OVER_CAPACITY")
+
+    def test_stale_version_flag_but_still_evaluated(self):
+        self._import()
+        body = _reconcile_body(version=42)
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200)
+        out = r.json()
+        self.assertFalse(out["version_match"])
+        self.assertEqual(out["version"], 1)
+        self.assertTrue(out["consistent"])
+
+    def test_coverage_duplicate_unknown_rejected_422(self):
+        self._import()
+        bad = {
+            "version": 1,
+            # 缺 S + 重复 + 不存在
+            "sources": [{"source_id": "SX", "injection": 1},
+                        {"source_id": "SX", "injection": 1}],
+            # 缺 U3 + 重复 U1 + 连接点 A 不可申报取用
+            "sinks": [{"sink_id": "U1", "withdrawal": 1},
+                      {"sink_id": "U1", "withdrawal": 1},
+                      {"sink_id": "U2", "withdrawal": 1},
+                      {"sink_id": "A", "withdrawal": 1}],
+            # 缺 P6 + 重复 P1 + 不存在 PX
+            "pipes": [
+                {"pipe_id": "P1", "capacity": 1, "reading": None},
+                {"pipe_id": "P1", "capacity": 1, "reading": None},
+                {"pipe_id": "PX", "capacity": 1, "reading": None},
+                {"pipe_id": "P2", "capacity": 1, "reading": None},
+                {"pipe_id": "P3", "capacity": 1, "reading": None},
+                {"pipe_id": "P4", "capacity": 1, "reading": None},
+                {"pipe_id": "P5", "capacity": 1, "reading": None},
+            ],
+        }
+        r = self.client.post("/api/meters/reconcile", json=bad)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "METER_RECONCILE_INVALID")
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("RECONCILE_SOURCE_MISSING", codes)
+        self.assertIn("RECONCILE_SINK_MISSING", codes)
+        self.assertIn("RECONCILE_PIPE_MISSING", codes)
+        self.assertIn("RECONCILE_PIPE_NOT_FOUND", codes)
+        self.assertIn("RECONCILE_SINK_NOT_SINK", codes)
+
+    def test_non_integer_or_negative_rejected_422(self):
+        self._import()
+        # 布尔注入、负容量、浮点读数
+        bad = _reconcile_body()
+        bad["sources"] = [{"source_id": "S", "injection": True}]
+        r = self.client.post("/api/meters/reconcile", json=bad)
+        self.assertEqual(r.status_code, 422)
+        bad = _reconcile_body()
+        bad["pipes"][0]["capacity"] = -1
+        r = self.client.post("/api/meters/reconcile", json=bad)
+        self.assertEqual(r.status_code, 422)
+        bad = _reconcile_body()
+        bad["pipes"][0]["reading"] = 1.5
+        r = self.client.post("/api/meters/reconcile", json=bad)
+        self.assertEqual(r.status_code, 422)
+        # 负取用量
+        bad = _reconcile_body()
+        bad["sinks"][0]["withdrawal"] = -1
+        r = self.client.post("/api/meters/reconcile", json=bad)
+        self.assertEqual(r.status_code, 422)
+
+    def test_empty_network_coverage(self):
+        body = {
+            "version": 0,
+            "sources": [],
+            "sinks": [],
+            "pipes": [],
+        }
+        r = self.client.post("/api/meters/reconcile", json=body)
+        self.assertEqual(r.status_code, 200)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        self.assertEqual(out["readings"], [])
+
+    def test_readonly_does_not_change_state(self):
+        self._import()
+        r = self.client.post("/api/meters/reconcile", json=_reconcile_body())
+        self.assertEqual(r.status_code, 200)
+        net = self.client.get("/api/network").json()
+        self.assertEqual(net["version"], 1)
+        self.assertEqual(self.client.get("/api/isolation/events").json(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

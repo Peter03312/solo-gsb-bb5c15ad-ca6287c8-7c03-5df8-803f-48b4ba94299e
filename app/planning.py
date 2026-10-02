@@ -41,6 +41,19 @@
 - 管段为双向共用输水上限：两方向净流量合计（即净流量绝对值）不得超过上限，
   按无向边容量建模；最大可交付总量 = 超级源→各水源→管网→各需求点→超级汇
   的整数最大流（对总需求封顶）。全部为整数容量，最大流为整数。
+
+读数核对（meter reconcile）规则（只读，不改阀位/事件/版本/快照）：
+- 调度员携带已读版本、每个水源的实际注入量、每个用水点的实际取用量、每条管段的
+  双向共用容量与可为 null 的带符号读数（以管段 from→to 为正，升/小时），核对
+  当前水源运行状态、关阀与待修复故障下读数是否自洽，并为缺报（null）管段求全部
+  可行解中的最小/最大流量（最小=最大时可确定）。
+- 硬约束：停运水源注入必须为 0；阻断管段（已关阀门/待修复故障）流量必须为 0；
+  每个节点 流入 + 注入 = 流出 + 取用；|管段流量| <= 双向共用容量。
+- 有向弧下界可行流（Dinic + 超级源/汇）判定可行并求一组可行整数流；缺报弧的
+  流量范围在剔除该弧的残量网络上，以两次最大流求可增/可减量。无可行解时
+  consistent=false 且不输出补值。
+- 注入、取用、容量均为非负整数；编号覆盖不足/重复/未知节点/非整数或负容量
+  整体拒绝（422）；版本过期仍按当前状态计算，仅标记 version_match=false。
 """
 from __future__ import annotations
 
@@ -84,6 +97,24 @@ DELIVERY_SINK_NOT_FOUND = "DELIVERY_SINK_NOT_FOUND"  # 用水点编号不存在
 DELIVERY_SINK_NOT_SINK = "DELIVERY_SINK_NOT_SINK"  # 节点存在但不是用水点
 DELIVERY_SINK_DUPLICATE = "DELIVERY_SINK_DUPLICATE"  # 用水点编号重复
 DELIVERY_DEMANDS_EMPTY = "DELIVERY_DEMANDS_EMPTY"  # 用水点需求列表为空
+
+# 读数核对请求问题（结构 / 编号 / 覆盖 / 重复 -> 422 整体拒绝）
+RECONCILE_SOURCE_NOT_FOUND = "RECONCILE_SOURCE_NOT_FOUND"
+RECONCILE_SOURCE_MISSING = "RECONCILE_SOURCE_MISSING"
+RECONCILE_SOURCE_DUPLICATE = "RECONCILE_SOURCE_DUPLICATE"
+RECONCILE_SINK_NOT_FOUND = "RECONCILE_SINK_NOT_FOUND"
+RECONCILE_SINK_NOT_SINK = "RECONCILE_SINK_NOT_SINK"
+RECONCILE_SINK_MISSING = "RECONCILE_SINK_MISSING"
+RECONCILE_SINK_DUPLICATE = "RECONCILE_SINK_DUPLICATE"
+RECONCILE_PIPE_NOT_FOUND = "RECONCILE_PIPE_NOT_FOUND"
+RECONCILE_PIPE_MISSING = "RECONCILE_PIPE_MISSING"
+RECONCILE_PIPE_DUPLICATE = "RECONCILE_PIPE_DUPLICATE"
+
+# 读数核对结果原因（200，consistent=false：当前状态/读数下无可行解或硬约束被违反）
+STOPPED_SOURCE_INJECTION = "STOPPED_SOURCE_INJECTION"  # 停运水源申报注入非 0
+BLOCKED_PIPE_FLOW = "BLOCKED_PIPE_FLOW"  # 阻断管段（关阀/待修复）读数非 0
+READING_OVER_CAPACITY = "READING_OVER_CAPACITY"  # 读数绝对值超过双向共用容量
+READINGS_INCONSISTENT = "READINGS_INCONSISTENT"  # 节点平衡/容量/停运阻断下无可行解
 
 # 结构性阻断问题（预演会给出，提交据此拒绝）
 BLOCKING_ISSUE_CODES = frozenset(
@@ -1019,6 +1050,514 @@ def evaluate_delivery(
         max_delivered_total=max_delivered,
         feasible=max_delivered == total_demand,
     )
+
+
+# ---------------------------------------------------------------- 读数核对
+
+
+@dataclass
+class ReconcileReason:
+    """读数核对不一致原因（200 响应，consistent=false 时给出）。"""
+
+    code: str
+    message: str
+    pipe_id: str | None = None
+    node_id: str | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "pipe_id": self.pipe_id,
+            "node_id": self.node_id,
+        }
+
+
+@dataclass
+class MeterRange:
+    """单条缺报管段在全部可行解中的流量范围（带符号，from→to 为正）。"""
+
+    pipe_id: str
+    min_flow: int
+    max_flow: int
+    # min_flow == max_flow 时该缺报读数可唯一确定
+    determinable: bool
+
+
+@dataclass
+class ReconcileResult:
+    """读数核对结果（只读计算，不改任何状态）。
+
+    - consistent：当前水源运行状态/关阀/待修复故障与注入、取用、容量、读数下
+      是否存在可行的整数流量分配；为 False 时 reasons 给出原因且 readings 为空。
+    - readings：缺报（null）管段的可行流量范围，按管段编号排序；
+      已申报读数原样可信，不在补值列表中返回。
+    """
+
+    consistent: bool
+    readings: list[MeterRange] = field(default_factory=list)
+    reasons: list[ReconcileReason] = field(default_factory=list)
+
+
+def validate_reconcile_request(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    injections: list[tuple[str, int]],
+    withdrawals: list[tuple[str, int]],
+    pipe_readings: list[tuple[str, int, int | None]],
+) -> list[Issue]:
+    """校验读数核对请求本身（结构 / 编号 / 覆盖 / 重复）。
+
+    - 水源编号必须完整覆盖当前管网全部水源（不多不少）、同批不重复；
+    - 用水点编号必须存在且为 sink，且完整覆盖全部 sink、同批不重复
+      （每个用水点的实际取用量都要申报，未取用按 0 申报）；
+    - 管段编号必须完整覆盖全部管段、同批不重复。
+    非负整数 / 读数带符号整数 / 非 null 类型由请求模型（pydantic）保证。
+    """
+    issues: list[Issue] = []
+
+    network_source_ids = {nid for nid, n in nodes.items() if n.type == "source"}
+    seen_sources: set[str] = set()
+    for source_id, _inj in injections:
+        if source_id in seen_sources:
+            issues.append(
+                Issue(
+                    RECONCILE_SOURCE_DUPLICATE,
+                    f"水源编号重复：{source_id}",
+                    source_id,
+                )
+            )
+            continue
+        seen_sources.add(source_id)
+        node = nodes.get(source_id)
+        if node is None or node.type != "source":
+            issues.append(
+                Issue(
+                    RECONCILE_SOURCE_NOT_FOUND,
+                    f"水源编号在当前管网不存在：{source_id}",
+                    source_id,
+                )
+            )
+    for missing in sorted(network_source_ids - seen_sources):
+        issues.append(
+            Issue(
+                RECONCILE_SOURCE_MISSING,
+                f"当前管网水源未在请求中列出（注入量须覆盖全部水源）：{missing}",
+                missing,
+            )
+        )
+
+    network_sink_ids = {nid for nid, n in nodes.items() if n.type == "sink"}
+    seen_sinks: set[str] = set()
+    for sink_id, _wd in withdrawals:
+        if sink_id in seen_sinks:
+            issues.append(
+                Issue(
+                    RECONCILE_SINK_DUPLICATE,
+                    f"用水点编号重复：{sink_id}",
+                    sink_id,
+                )
+            )
+            continue
+        seen_sinks.add(sink_id)
+        node = nodes.get(sink_id)
+        if node is None:
+            issues.append(
+                Issue(
+                    RECONCILE_SINK_NOT_FOUND,
+                    f"用水点编号不存在：{sink_id}",
+                    sink_id,
+                )
+            )
+        elif node.type != "sink":
+            issues.append(
+                Issue(
+                    RECONCILE_SINK_NOT_SINK,
+                    f"节点 {sink_id} 不是用水点，仅用水点节点可申报取用量",
+                    sink_id,
+                )
+            )
+    for missing in sorted(network_sink_ids - seen_sinks):
+        issues.append(
+            Issue(
+                RECONCILE_SINK_MISSING,
+                f"当前管网用水点未在请求中列出（取用量须覆盖全部用水点）：{missing}",
+                missing,
+            )
+        )
+
+    seen_pipes: set[str] = set()
+    for pipe_id, _cap, _reading in pipe_readings:
+        if pipe_id in seen_pipes:
+            issues.append(
+                Issue(
+                    RECONCILE_PIPE_DUPLICATE,
+                    f"管段编号重复：{pipe_id}",
+                    pipe_id,
+                )
+            )
+            continue
+        seen_pipes.add(pipe_id)
+        if pipe_id not in pipes:
+            issues.append(
+                Issue(
+                    RECONCILE_PIPE_NOT_FOUND,
+                    f"管段编号在当前管网不存在：{pipe_id}",
+                    pipe_id,
+                )
+            )
+    for missing in sorted(set(pipes) - seen_pipes):
+        issues.append(
+            Issue(
+                RECONCILE_PIPE_MISSING,
+                f"当前管网管段未在请求中列出（容量与读数须覆盖全部管段）：{missing}",
+                missing,
+            )
+        )
+    return issues
+
+
+class _Dinic:
+    """整数容量 Dinic 最大流（残量边以可变 list 表示）。
+
+    与既有 _undirected_max_flow 相同的增广路算法，抽出为可复用类：
+    有下界可行流判定（超级源/汇）与缺报弧范围计算（剔除目标弧的残量网）共用。
+
+    边为 [v, cap, rev, sign, flow]：sign=1 为配对正向边、sign=-1 为其反向边。
+    需要“独立的对向容量弧”（如无向边的初始双向容量、y 残量的两个方向）时
+    由调用方再 add_arc 一次。flow 只记录本配对正向弧在最大流中承担的净流量：
+    沿正向边增广 +、沿其反向边回撤 -，多次 add_arc 的独立弧互不污染。
+    """
+
+    def __init__(self, n: int):
+        self.n = n
+        self.graph: list[list[list[int]]] = [[] for _ in range(n)]
+
+    def add_arc(self, u: int, v: int, cap: int) -> int:
+        """添加配对有向弧 u->v（容量 cap，反向残量初值 0），返回正向边索引。"""
+        # [终点, 容量, 对边索引, 方向(1正向/-1反向), 该正向弧承担的净流量]
+        self.graph[u].append([v, cap, len(self.graph[v]), 1, 0])
+        self.graph[v].append([u, 0, len(self.graph[u]) - 1, -1, 0])
+        return len(self.graph[u]) - 1
+
+    def max_flow(self, source: int, sink: int) -> int:
+        total = 0
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), self.n * 4 + 1000))
+        while True:
+            level = [-1] * self.n
+            level[source] = 0
+            queue: deque[int] = deque([source])
+            while queue:
+                u = queue.popleft()
+                for v, cap, _rev, _sign, _flow in self.graph[u]:
+                    if cap > 0 and level[v] < 0:
+                        level[v] = level[u] + 1
+                        queue.append(v)
+            if level[sink] < 0:
+                return total
+
+            cur = [0] * self.n
+
+            def dfs(u: int, pushed: int) -> int:
+                if u == sink:
+                    return pushed
+                while cur[u] < len(self.graph[u]):
+                    edge = self.graph[u][cur[u]]
+                    v, cap, rev, sign, _flow = edge
+                    if cap > 0 and level[v] == level[u] + 1:
+                        sent = dfs(v, min(pushed, cap))
+                        if sent:
+                            edge[1] -= sent
+                            back = self.graph[v][rev]
+                            back[1] += sent
+                            # 沿正向边增广：该弧净流量 += sent；
+                            # 沿反向边增广：所对正向弧（即 back）净流量 -= sent。
+                            if sign == 1:
+                                edge[4] += sent
+                            else:
+                                back[4] -= sent
+                            return sent
+                    cur[u] += 1
+                return 0
+
+            while True:
+                pushed = dfs(source, 10**18)
+                if not pushed:
+                    break
+                total += pushed
+
+
+def _bounded_feasible_flow(
+    node_ids: list[str],
+    arcs: list[tuple[str, str, int, int]],
+    balances: dict[str, int],
+):
+    """有向弧下界可行流（整数）。
+
+    - arcs：(u, v, low, high)，0 <= low <= high；
+    - balances：各节点净供给 b(n)=注入-取用。
+      平衡条件为 流入 + b = 流出，即 流出-流入 = b。
+    对每条弧先强制流下界 low：b(u)-=low、b(v)+=low；
+    b(n)>0（净需入）时加超级源 SS->n（容量 b(n)），
+    b(n)<0（净需出）时加 n->TT（容量 -b(n)），跑 SS→TT 最大流，
+    全部 SS 出边饱和即存在可行流。返回 (是否可行, 各弧实际流量)。
+    """
+    index = {nid: i for i, nid in enumerate(node_ids)}
+    ss = len(node_ids)
+    tt = ss + 1
+    dinic = _Dinic(tt + 1)
+
+    arc_edges: list[tuple[int, int, int]] = []  # (正向边所在节点, 边索引, low)
+    b = {nid: int(balances.get(nid, 0)) for nid in node_ids}
+    required = 0
+    for u, v, low, high in arcs:
+        iu, iv = index[u], index[v]
+        edge_idx = dinic.add_arc(iu, iv, high - low)
+        arc_edges.append((iu, edge_idx, low))
+        b[u] -= low
+        b[v] += low
+
+    for nid in node_ids:
+        need = b[nid]
+        if need > 0:
+            dinic.add_arc(ss, index[nid], need)
+            required += need
+        elif need < 0:
+            dinic.add_arc(index[nid], tt, -need)
+
+    flow_total = dinic.max_flow(ss, tt)
+    if flow_total != required:
+        return False, []
+
+    # 下界可行流中弧流量 = low + 该正向弧在超级源流中实际承担的净流量
+    # （用 add_arc 维护的净流量计，独立反向弧不会污染该值）
+    flows: list[int] = []
+    for iu, edge_idx, low in arc_edges:
+        used = dinic.graph[iu][edge_idx][4]
+        flows.append(low + used)
+    return True, flows
+
+
+def _residual_max_flow(
+    node_ids: list[str],
+    residual_arcs: list[tuple[str, str, int]],
+    source_id: str,
+    sink_id: str,
+) -> int:
+    """在给定有向残量弧（u,v,剩余容量）上求 source_id→sink_id 最大流。
+
+    每条残量弧按标准配对有向弧添加（自带反向回撤边）：这里的残量弧本身就是
+    某条有向弧的一个方向剩余容量，其对向回撤由 Dinic 的配对反向边承载。
+    """
+    index = {nid: i for i, nid in enumerate(node_ids)}
+    dinic = _Dinic(len(node_ids))
+    for u, v, cap in residual_arcs:
+        if cap > 0:
+            dinic.add_arc(index[u], index[v], cap)
+    return dinic.max_flow(index[source_id], index[sink_id])
+
+
+def reconcile_meters(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    injections: list[tuple[str, int]],
+    withdrawals: list[tuple[str, int]],
+    pipe_readings: list[tuple[str, int, int | None]],
+    *,
+    blocked_pipe_ids: frozenset[str] = frozenset(),
+) -> ReconcileResult:
+    """按当前水源运行状态、关阀与待修复故障核对管段流量计读数（只读）。
+
+    injections：(水源编号, 实际注入量)；withdrawals：(用水点编号, 实际取用量)；
+    pipe_readings：(管段编号, 双向共用容量, 带符号读数或 None)。
+    读数以管段 from→to 为正；None 表示该管段缺报，需推断可行流量范围。
+    blocked_pipe_ids：已关闭阀门与待修复故障管段，流量必须为 0
+    （与可达性/流量核算口径完全一致）。调用方须先过 validate_reconcile_request。
+
+    带符号流量 f∈[-c,c] 做偏移 y=f+c∈[0,2c]（等价于先强制 v→u 流 c）；
+    已申报读数直接固定（f=reading，y 固定），缺报弧留作自由变量。
+    """
+    injection_map = dict(injections)
+    withdrawal_map = dict(withdrawals)
+    reading_map = {pid: (cap, reading) for pid, cap, reading in pipe_readings}
+
+    # 硬约束（先于可行流求解，直接给出可读原因）：
+    # 停运水源注入必须为 0；阻断管段流量必须为 0；|读数| <= 容量。
+    hard_reasons: list[ReconcileReason] = []
+    for nid in sorted(injection_map):
+        node = nodes[nid]
+        if not node.running and injection_map[nid] != 0:
+            hard_reasons.append(
+                ReconcileReason(
+                    STOPPED_SOURCE_INJECTION,
+                    f"水源 {nid} 已停运，实际注入量必须为 0，申报为 "
+                    f"{injection_map[nid]}",
+                    node_id=nid,
+                )
+            )
+
+    for pid in sorted(reading_map):
+        cap, reading = reading_map[pid]
+        if pid in blocked_pipe_ids:
+            if reading not in (None, 0):
+                hard_reasons.append(
+                    ReconcileReason(
+                        BLOCKED_PIPE_FLOW,
+                        f"管段 {pid} 已关闭阀门或为待修复故障管段，流量必须为 0，"
+                        f"读数为 {reading}",
+                        pipe_id=pid,
+                    )
+                )
+        elif reading is not None and abs(reading) > cap:
+            hard_reasons.append(
+                ReconcileReason(
+                    READING_OVER_CAPACITY,
+                    f"管段 {pid} 读数 {reading} 的绝对值超过双向共用容量 {cap}",
+                    pipe_id=pid,
+                )
+            )
+
+    if hard_reasons:
+        return ReconcileResult(consistent=False, readings=[], reasons=hard_reasons)
+
+    node_ids = list(nodes.keys())
+    # b(n) = 注入 - 取用（junction 恒为 0）
+    balances = {
+        nid: int(injection_map.get(nid, 0)) - int(withdrawal_map.get(nid, 0))
+        for nid in node_ids
+    }
+
+    # 注入总量与取用总量不守恒时，任何节点平衡都无法同时成立 -> 无可行解
+    if sum(injection_map.values()) != sum(withdrawal_map.values()):
+        return ReconcileResult(
+            consistent=False,
+            readings=[],
+            reasons=[
+                ReconcileReason(
+                    READINGS_INCONSISTENT,
+                    f"水源实际注入总量 {sum(injection_map.values())} 与用水点实际取用"
+                    f"总量 {sum(withdrawal_map.values())} 不相等，节点平衡无法全部成立",
+                )
+            ],
+        )
+
+    arcs: list[tuple[str, str, int, int]] = []
+    reported: dict[str, int] = {}
+    missing: list[str] = []
+    # 带符号流量 f∈[-c,c] 偏移为 y=f+c∈[0,2c]：偏移量等价于一条 v→u 的
+    # 固定流 c，因此对**每条容量 c 的管段**（含阻断/固定读数）都先平移节点
+    # 平衡（u 的 y 净出多 c、v 少 c），再由 y 弧的下界承载实际值。
+    shifted_balances = dict(balances)
+    for pid in sorted(pipes):
+        pipe = pipes[pid]
+        cap, reading = reading_map[pid]
+        shifted_balances[pipe.from_node] = (
+            shifted_balances.get(pipe.from_node, 0) + cap
+        )
+        shifted_balances[pipe.to_node] = (
+            shifted_balances.get(pipe.to_node, 0) - cap
+        )
+        if pid in blocked_pipe_ids or cap == 0:
+            # 阻断管段或容量 0：f=0，y=c 固定
+            arcs.append((pipe.from_node, pipe.to_node, cap, cap))
+            if reading is None:
+                missing.append(pid)
+        elif reading is None:
+            # 缺报自由弧：f∈[-c,c] -> y∈[0,2c]
+            arcs.append((pipe.from_node, pipe.to_node, 0, 2 * cap))
+            missing.append(pid)
+        else:
+            # 已申报读数固定：f=reading -> y=reading+cap
+            y_fixed = reading + cap
+            arcs.append((pipe.from_node, pipe.to_node, y_fixed, y_fixed))
+            reported[pid] = reading
+
+    feasible, arc_flows = _bounded_feasible_flow(
+        node_ids, arcs, shifted_balances
+    )
+    if not feasible:
+        return ReconcileResult(
+            consistent=False,
+            readings=[],
+            reasons=[
+                ReconcileReason(
+                    READINGS_INCONSISTENT,
+                    "当前水源运行状态、关阀与待修复故障下，注入、取用、容量与已申报"
+                    "读数无法同时满足节点平衡与容量约束，无可行流量分配",
+                )
+            ],
+        )
+
+    # 一组可行流（偏移量）：y -> f = y - c（arcs 按 sorted(pipes) 顺序构建）
+    flows: dict[str, int] = {}
+    for pid, y_flow in zip(sorted(pipes), arc_flows):
+        cap = reading_map[pid][0]
+        flows[pid] = y_flow - cap
+    # 已申报弧恢复后必须等于读数（下界=上界，数值上恒成立）
+    for pid, reading in reported.items():
+        assert flows[pid] == reading, (pid, flows[pid], reading)
+
+    # 缺报范围：以可行流构造有向残量网（残量=上界-当前 y、下界方向=当前 y），
+    # 剔除目标缺报弧自身后，两次最大流求该弧 y 可增/可减的最大量。
+    free_pipes = [
+        pid
+        for pid in sorted(pipes)
+        if pid not in blocked_pipe_ids and reading_map[pid][0] > 0
+        and reading_map[pid][1] is None
+    ]
+
+    def residual_arcs_excluding(target: str) -> list[tuple[str, str, int]]:
+        """其余自由缺报管段在当前可行流（偏移 y=f+c∈[0,2c]）下的残量弧。
+
+        每条自由弧是 [0,2c] 上的独立有向弧：正向（from→to）可增 2c-y，
+        反向（to→from）可回撤 y。平行管段（同一对节点多条管段）各自独立。
+        """
+        out: list[tuple[str, str, int]] = []
+        for pid in free_pipes:
+            if pid == target:
+                continue
+            pipe = pipes[pid]
+            cap = reading_map[pid][0]
+            y = flows[pid] + cap
+            out.append((pipe.from_node, pipe.to_node, 2 * cap - y))
+            out.append((pipe.to_node, pipe.from_node, y))
+        return out
+
+    ranges: list[MeterRange] = []
+    for pid in sorted(missing):
+        pipe = pipes[pid]
+        cap = reading_map[pid][0]
+        if pid in blocked_pipe_ids or cap == 0:
+            ranges.append(
+                MeterRange(pipe_id=pid, min_flow=0, max_flow=0, determinable=True)
+            )
+            continue
+
+        residual = residual_arcs_excluding(pid)
+        f0 = flows[pid]
+        y0 = f0 + cap
+        # 残量环流定理：增大 u→v 弧流量需要其余边提供一条 v→u 的补偿路径，
+        # 减小则需要 u→v 路径；增量同时受该弧自身上界 2c / 下界 0 限制。
+        inc = min(
+            2 * cap - y0,
+            _residual_max_flow(node_ids, residual, pipe.to_node, pipe.from_node),
+        )
+        dec = min(
+            y0,
+            _residual_max_flow(node_ids, residual, pipe.from_node, pipe.to_node),
+        )
+        f_min = f0 - dec
+        f_max = f0 + inc
+        ranges.append(
+            MeterRange(
+                pipe_id=pid,
+                min_flow=f_min,
+                max_flow=f_max,
+                determinable=f_min == f_max,
+            )
+        )
+
+    return ReconcileResult(consistent=True, readings=ranges, reasons=[])
 
 
 # ---------------------------------------------------------------- 状态快照
