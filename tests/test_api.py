@@ -1797,5 +1797,324 @@ class DeliveryApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/isolation/events").json(), [])
 
 
+# ---------------------------------------------------------------- 流量计读数核对
+
+
+# 带环管网（环上流量有一个自由度，缺报管段只能给出范围）：
+# S --P1--> A --P2--> U
+# S --P3--> U
+RING_NETWORK = {
+    "nodes": [
+        {"id": "S", "type": "source"},
+        {"id": "A", "type": "junction"},
+        {"id": "U", "type": "sink"},
+    ],
+    "pipes": [
+        {"id": "P1", "from": "S", "to": "A"},
+        {"id": "P2", "from": "A", "to": "U"},
+        {"id": "P3", "from": "S", "to": "U"},
+    ],
+}
+
+
+# 流量计核对请求样例（基于 VALID_NETWORK：注入 30 = U1/U2/U3 各 10）
+def _metering_body(version=1, *, injection=30, pipes=None, withdrawals=None):
+    return {
+        "version": version,
+        "sources": [{"source_id": "S", "injection": injection}],
+        "sinks": [
+            {"sink_id": sid, "withdrawal": w}
+            for sid, w in (withdrawals or [("U1", 10), ("U2", 10), ("U3", 10)])
+        ],
+        "pipes": [
+            {"pipe_id": pid, "capacity": cap, "reading": reading}
+            for pid, cap, reading in (
+                pipes
+                or [
+                    ("P1", 100, 30),
+                    ("P2", 100, 20),
+                    ("P3", 100, 10),
+                    ("P4", 100, 10),
+                    ("P5", 100, 10),
+                    ("P6", 100, 10),
+                ]
+            )
+        ],
+    }
+
+
+class MeteringApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.fail_commit = False
+
+    def _import(self, network=VALID_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_all_readings_consistent(self):
+        self._import()
+        r = self.client.post("/api/metering/reconcile", json=_metering_body())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            r.json(),
+            {"version": 1, "version_match": True, "consistent": True, "estimates": []},
+        )
+
+    def test_missing_reading_determined_on_tree(self):
+        self._import()
+        body = _metering_body()
+        for p in body["pipes"]:
+            if p["pipe_id"] == "P2":
+                p["reading"] = None
+        r = self.client.post("/api/metering/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        self.assertEqual(
+            out["estimates"],
+            [{"pipe_id": "P2", "min_flow": 20, "max_flow": 20, "determined": True}],
+        )
+
+    def test_ring_missing_readings_give_ranges(self):
+        self._import(RING_NETWORK)
+        body = {
+            "version": 1,
+            "sources": [{"source_id": "S", "injection": 10}],
+            "sinks": [{"sink_id": "U", "withdrawal": 10}],
+            "pipes": [
+                {"pipe_id": "P1", "capacity": 6, "reading": None},
+                {"pipe_id": "P2", "capacity": 6, "reading": None},
+                {"pipe_id": "P3", "capacity": 10, "reading": None},
+            ],
+        }
+        r = self.client.post("/api/metering/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        self.assertEqual(
+            out["estimates"],
+            [
+                {"pipe_id": "P1", "min_flow": 0, "max_flow": 6, "determined": False},
+                {"pipe_id": "P2", "min_flow": 0, "max_flow": 6, "determined": False},
+                {"pipe_id": "P3", "min_flow": 4, "max_flow": 10, "determined": False},
+            ],
+        )
+
+    def test_conflicting_readings_inconsistent_no_estimates(self):
+        self._import()
+        # A 点不守恒：P1=30 进，P3=10 + P2=25 出
+        body = _metering_body(
+            pipes=[
+                ("P1", 100, 30),
+                ("P2", 100, 25),
+                ("P3", 100, 10),
+                ("P4", 100, 10),
+                ("P5", 100, 10),
+                ("P6", 100, 10),
+            ]
+        )
+        r = self.client.post("/api/metering/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertFalse(out["consistent"])
+        self.assertEqual(out["estimates"], [])  # 不一致时不输出补值
+
+    def test_stale_version_still_reconciled_against_current(self):
+        self._import()
+        r = self.client.post("/api/metering/reconcile", json=_metering_body(version=99))
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["version"], 1)
+        self.assertFalse(out["version_match"])
+        self.assertTrue(out["consistent"])
+
+    def test_blocked_pipes_must_have_zero_flow(self):
+        self._import()
+        # 隔离 P6（关 P4）：P4 已关、P6 待修复，两者流量必须为零
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 阻断管段读数非零 -> 不一致
+        body = _metering_body(version=2)
+        r = self.client.post("/api/metering/reconcile", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(r.json()["consistent"])
+        # 阻断管段缺报、下游取用归零 -> 一致且确定为 0
+        body = _metering_body(
+            version=2,
+            injection=20,
+            withdrawals=[("U1", 10), ("U2", 10), ("U3", 0)],
+            pipes=[
+                ("P1", 100, 20),
+                ("P2", 100, 10),
+                ("P3", 100, 10),
+                ("P4", 100, None),
+                ("P5", 100, 10),
+                ("P6", 100, None),
+            ],
+        )
+        r = self.client.post("/api/metering/reconcile", json=body)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        self.assertEqual(
+            out["estimates"],
+            [
+                {"pipe_id": "P4", "min_flow": 0, "max_flow": 0, "determined": True},
+                {"pipe_id": "P6", "min_flow": 0, "max_flow": 0, "determined": True},
+            ],
+        )
+
+    def test_stopped_source_must_inject_zero(self):
+        self._import(TWO_SOURCE_NETWORK)
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        base = {
+            "version": 2,
+            "sinks": [{"sink_id": "U1", "withdrawal": 3},
+                      {"sink_id": "U2", "withdrawal": 5}],
+            "pipes": [{"pipe_id": pid, "capacity": 100, "reading": None}
+                      for pid in ("Q1", "Q3", "Q2", "Q4")],
+        }
+        # 停运的 S1 注入非零 -> 不一致
+        body = dict(base, sources=[{"source_id": "S1", "injection": 8},
+                                   {"source_id": "S2", "injection": 8}])
+        r = self.client.post("/api/metering/reconcile", json=body)
+        self.assertFalse(r.json()["consistent"])
+        # 停运源零注入、S2 顶供 8 -> 一致，树状管网全部可确定
+        body = dict(base, sources=[{"source_id": "S1", "injection": 0},
+                                   {"source_id": "S2", "injection": 8}])
+        r = self.client.post("/api/metering/reconcile", json=body)
+        out = r.json()
+        self.assertTrue(out["consistent"])
+        self.assertEqual(
+            out["estimates"],
+            [
+                {"pipe_id": "Q1", "min_flow": 0, "max_flow": 0, "determined": True},
+                {"pipe_id": "Q2", "min_flow": 3, "max_flow": 3, "determined": True},
+                {"pipe_id": "Q3", "min_flow": 8, "max_flow": 8, "determined": True},
+                {"pipe_id": "Q4", "min_flow": 5, "max_flow": 5, "determined": True},
+            ],
+        )
+
+    def test_missing_and_unknown_and_duplicate_ids_rejected(self):
+        self._import()
+        body = _metering_body()
+        body["sources"] = []  # 水源未覆盖
+        body["sinks"].append({"sink_id": "U1", "withdrawal": 1})  # 用水点重复
+        body["sinks"].append({"sink_id": "UX", "withdrawal": 1})  # 用水点不存在
+        body["sinks"].append({"sink_id": "A", "withdrawal": 1})   # 节点不是用水点
+        body["pipes"] = [p for p in body["pipes"] if p["pipe_id"] != "P6"]  # 管段未覆盖
+        body["pipes"].append({"pipe_id": "P1", "capacity": 1, "reading": None})  # 重复
+        body["pipes"].append({"pipe_id": "PX", "capacity": 1, "reading": None})  # 不存在
+        r = self.client.post("/api/metering/reconcile", json=body)
+        self.assertEqual(r.status_code, 422)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "METERING_REQUEST_INVALID")
+        codes = {i["code"] for i in err["issues"]}
+        self.assertEqual(
+            codes,
+            {
+                "METERING_SOURCE_MISSING",
+                "METERING_SINK_DUPLICATE",
+                "METERING_SINK_NOT_FOUND",
+                "METERING_PIPE_MISSING",
+                "METERING_PIPE_DUPLICATE",
+                "METERING_PIPE_NOT_FOUND",
+            },
+        )
+
+    def test_non_integer_and_negative_values_rejected(self):
+        self._import()
+
+        def post_raw(raw):
+            return self.client.post(
+                "/api/metering/reconcile",
+                content=json.dumps(raw),
+                headers={"Content-Type": "application/json"},
+            )
+
+        base = _metering_body()
+        # 布尔注入不是整数
+        bad = json.loads(json.dumps(base))
+        bad["sources"][0]["injection"] = True
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 负取用
+        bad = json.loads(json.dumps(base))
+        bad["sinks"][0]["withdrawal"] = -1
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 负容量
+        bad = json.loads(json.dumps(base))
+        bad["pipes"][0]["capacity"] = -5
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 小数容量
+        bad = json.loads(json.dumps(base))
+        bad["pipes"][0]["capacity"] = 1.5
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 字符串读数不自动转型
+        bad = json.loads(json.dumps(base))
+        bad["pipes"][0]["reading"] = "30"
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 额外字段
+        bad = json.loads(json.dumps(base))
+        bad["pipes"][0]["extra"] = 1
+        self.assertEqual(post_raw(bad).status_code, 422)
+        # 负读数合法（反向流）：P3 定义为 A->U1，读数 -10 时 A 点不守恒 -> 不一致但非 422
+        bad = json.loads(json.dumps(base))
+        bad["pipes"][2]["reading"] = -10
+        r = post_raw(bad)
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["consistent"])
+
+    def test_empty_network_reconciles_with_empty_lists(self):
+        # 空网（版本 0）：三类列表均为空即完整覆盖，零和平衡恒一致
+        r = self.client.post(
+            "/api/metering/reconcile",
+            json={"version": 0, "sources": [], "sinks": [], "pipes": []},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertTrue(out["version_match"])
+        self.assertTrue(out["consistent"])
+        self.assertEqual(out["estimates"], [])
+
+    def test_read_only_no_version_valve_event_or_snapshot_change(self):
+        info = self._import()
+        snapshot_after_import = info["snapshot_id"]
+        # 一致、不一致、被拒绝的请求都不得改变任何状态
+        self.client.post("/api/metering/reconcile", json=_metering_body())
+        bad_balance = _metering_body(injection=31)
+        r = self.client.post("/api/metering/reconcile", json=bad_balance)
+        self.assertFalse(r.json()["consistent"])
+        bad_request = _metering_body()
+        bad_request["pipes"] = []
+        self.client.post("/api/metering/reconcile", json=bad_request)
+
+        net = self.client.get("/api/network").json()
+        self.assertEqual(net["version"], 1)
+        snap = self.client.get("/api/snapshots").json()
+        self.assertEqual([s["id"] for s in snap], [snapshot_after_import])
+        self.assertTrue(
+            all(p["valve_closed"] is False for p in net["pipes"] if p["has_valve"])
+        )
+        self.assertEqual(self.client.get("/api/isolation/events").json(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

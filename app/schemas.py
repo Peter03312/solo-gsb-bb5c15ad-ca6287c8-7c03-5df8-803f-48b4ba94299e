@@ -124,6 +124,63 @@ class DeliveryEvaluateIn(BaseModel):
     )
 
 
+class MeteringSourceIn(BaseModel):
+    """单个水源的实际注入量（非负整数升/小时；停运水源注入必须为零，仍须列出）。"""
+
+    source_id: str = Field(min_length=1, description="水源节点编号")
+    # 注入量为非负整数：StrictInt 拒绝 true/false 等非整数类型（类型错误整体拒绝）
+    injection: StrictInt = Field(ge=0, description="实际注入量（非负整数，升/小时）")
+
+    model_config = {"extra": "forbid"}
+
+
+class MeteringSinkIn(BaseModel):
+    """单个用水点的实际取用量（非负整数升/小时；须覆盖当前管网全部用水点）。"""
+
+    sink_id: str = Field(min_length=1, description="用水点节点编号")
+    withdrawal: StrictInt = Field(ge=0, description="实际取用量（非负整数，升/小时）")
+
+    model_config = {"extra": "forbid"}
+
+
+class MeteringPipeIn(BaseModel):
+    """单条管段的双向共用容量与可为空的带符号流量计读数。
+
+    读数以导入管段的 from→to 为正（负值表示 to→from 反向流），单位升/小时；
+    reading 为 null（或缺省）表示该表计缺报，由系统给出可推断范围。
+    """
+
+    pipe_id: str = Field(min_length=1, description="管段编号")
+    capacity: StrictInt = Field(
+        ge=0, description="双向共用容量（非负整数，升/小时）"
+    )
+    reading: StrictInt | None = Field(
+        default=None, description="带符号读数（from→to 为正）；null 表示缺报"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class MeteringReconcileIn(BaseModel):
+    """流量计读数核对入参：已读版本 + 每个水源注入量 + 每个用水点取用量
+    + 覆盖全部管段的（双向共用容量, 可空读数）。
+
+    水源、用水点、管段编号均须完整覆盖当前管网（不多不少、同类不重复）；
+    编号覆盖不足、重复、未知节点整体拒绝（422）。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    sources: list[MeteringSourceIn] = Field(
+        description="每个水源的实际注入量（须覆盖当前管网全部水源；空网为空列表）"
+    )
+    sinks: list[MeteringSinkIn] = Field(
+        description="每个用水点的实际取用量（须覆盖全部用水点；空网为空列表）"
+    )
+    pipes: list[MeteringPipeIn] = Field(
+        description="每条管段的双向共用容量与可空读数（须覆盖全部管段；空网为空列表）"
+    )
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -271,6 +328,27 @@ class DeliveryEvaluateOut(BaseModel):
     total_demand: int
     max_delivered_total: int
     feasible: bool
+
+
+class MeteringEstimateOut(BaseModel):
+    """单条缺报管段的可推断流量范围（from→to 为正，升/小时）。"""
+
+    pipe_id: str
+    min_flow: int = Field(description="全部可行解中的最小流量（带符号）")
+    max_flow: int = Field(description="全部可行解中的最大流量（带符号）")
+    determined: bool = Field(description="min_flow == max_flow，即流量可唯一确定")
+
+
+class MeteringReconcileOut(BaseModel):
+    """流量计读数核对只读结果。
+
+    consistent=False（无可行解）时 estimates 为空，不输出任何补值。
+    """
+
+    version: int
+    version_match: bool
+    consistent: bool
+    estimates: list[MeteringEstimateOut]
 
 
 class EventOut(BaseModel):

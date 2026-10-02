@@ -18,9 +18,11 @@ from app.planning import (  # noqa: E402
     evaluate_source_switch,
     freeze_state,
     reachable_sink_ids,
+    reconcile_metering,
     recommend_plan,
     validate_delivery_request,
     validate_import,
+    validate_metering_request,
     _undirected_max_flow,
     DUPLICATE_NODE_ID,
     DUPLICATE_PIPE_ID,
@@ -47,6 +49,15 @@ from app.planning import (  # noqa: E402
     DELIVERY_SINK_NOT_SINK,
     DELIVERY_SINK_DUPLICATE,
     DELIVERY_DEMANDS_EMPTY,
+    METERING_SOURCE_NOT_FOUND,
+    METERING_SOURCE_MISSING,
+    METERING_SOURCE_DUPLICATE,
+    METERING_SINK_NOT_FOUND,
+    METERING_SINK_MISSING,
+    METERING_SINK_DUPLICATE,
+    METERING_PIPE_NOT_FOUND,
+    METERING_PIPE_MISSING,
+    METERING_PIPE_DUPLICATE,
 )
 
 
@@ -1009,6 +1020,326 @@ class DeliveryMaxFlowTests(unittest.TestCase):
             [("U1", 100), ("U2", 100)],
         )
         self.assertEqual(flow, 5)
+
+
+# ---------------------------------------------------------------- 流量计读数核对
+
+
+def build_metering_tree():
+    """树状管网（树中每条管段流量均可被平衡条件唯一确定）：
+
+    S --P1--> A --P2--> B --P4--> D --P6--> U3
+               |           |
+              P3          P5
+               v           v
+              U1          U2
+    """
+    nodes, pipes = build_demo()
+    injections = [("S", 30)]
+    withdrawals = [("U1", 10), ("U2", 10), ("U3", 10)]
+    entries = [
+        ("P1", 100, 30),
+        ("P2", 100, 20),
+        ("P3", 100, 10),
+        ("P4", 100, 10),
+        ("P5", 100, 10),
+        ("P6", 100, 10),
+    ]
+    return nodes, pipes, injections, withdrawals, entries
+
+
+def build_metering_ring():
+    """带环管网（环上流量有一个自由度，缺报管段只能给出范围）：
+
+    S --P1--> A --P2--> U
+    S --P3--> U
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "U": Node("U", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A"),
+        "P2": Pipe("P2", "A", "U"),
+        "P3": Pipe("P3", "S", "U"),
+    }
+    return nodes, pipes
+
+
+def _estimates_by_pipe(result):
+    return {e.pipe_id: e for e in result.estimates}
+
+
+class MeteringValidationTests(unittest.TestCase):
+    def test_valid_request_no_issues(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        issues = validate_metering_request(
+            nodes, pipes, injections, withdrawals, entries
+        )
+        self.assertEqual(issues, [])
+
+    def test_missing_source_sink_pipe(self):
+        nodes, pipes, _inj, _wd, entries = build_metering_tree()
+        issues = validate_metering_request(
+            nodes,
+            pipes,
+            [],                                  # 缺 S
+            [("U1", 10), ("U2", 10)],            # 缺 U3
+            [e for e in entries if e[0] != "P6"],  # 缺 P6
+        )
+        codes = {i.code for i in issues}
+        self.assertEqual(
+            codes,
+            {METERING_SOURCE_MISSING, METERING_SINK_MISSING, METERING_PIPE_MISSING},
+        )
+
+    def test_unknown_and_duplicate_ids(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        issues = validate_metering_request(
+            nodes,
+            pipes,
+            injections + [("S", 1), ("SX", 1), ("A", 1)],
+            withdrawals + [("U1", 1), ("UX", 1), ("S", 1)],
+            entries + [("P1", 1, None), ("PX", 1, None)],
+        )
+        codes = {i.code for i in issues}
+        self.assertEqual(
+            codes,
+            {
+                METERING_SOURCE_DUPLICATE,
+                METERING_SOURCE_NOT_FOUND,   # SX 不存在、A 不是水源，各一条
+                METERING_SINK_DUPLICATE,
+                METERING_SINK_NOT_FOUND,     # UX 不存在、S 不是用水点，各一条
+                METERING_PIPE_DUPLICATE,
+                METERING_PIPE_NOT_FOUND,
+            },
+        )
+        self.assertEqual(
+            sum(1 for i in issues if i.code == METERING_SOURCE_NOT_FOUND), 2
+        )
+        self.assertEqual(
+            sum(1 for i in issues if i.code == METERING_SINK_NOT_FOUND), 2
+        )
+
+    def test_empty_network_coverage_uses_empty_lists(self):
+        # 空网：三类列表均为空即完整覆盖
+        self.assertEqual(validate_metering_request({}, {}, [], [], []), [])
+        # 空网上申报任何编号都视为不存在
+        issues = validate_metering_request(
+            {}, {}, [("S", 1)], [("U", 1)], [("P", 1, None)]
+        )
+        codes = {i.code for i in issues}
+        self.assertEqual(
+            codes,
+            {
+                METERING_SOURCE_NOT_FOUND,
+                METERING_SINK_NOT_FOUND,
+                METERING_PIPE_NOT_FOUND,
+            },
+        )
+
+
+class MeteringReconcileTests(unittest.TestCase):
+    def test_all_readings_consistent_no_estimates(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        self.assertEqual(result.estimates, [])
+
+    def test_missing_reading_on_tree_is_determined(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        # P2 缺报：A 点平衡 -> P2 = P1 - P3 = 30 - 10 = 20
+        entries = [(pid, cap, None if pid == "P2" else r) for pid, cap, r in entries]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        self.assertEqual(list(estimates), ["P2"])
+        self.assertEqual((estimates["P2"].min_flow, estimates["P2"].max_flow), (20, 20))
+        self.assertTrue(estimates["P2"].determined)
+
+    def test_all_missing_on_tree_still_determined(self):
+        nodes, pipes, injections, withdrawals, _entries = build_metering_tree()
+        entries = [(pid, 100, None) for pid in pipes]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        expected = {"P1": 30, "P2": 20, "P3": 10, "P4": 10, "P5": 10, "P6": 10}
+        self.assertEqual(set(estimates), set(expected))
+        for pid, flow in expected.items():
+            self.assertEqual(
+                (estimates[pid].min_flow, estimates[pid].max_flow), (flow, flow), pid
+            )
+            self.assertTrue(estimates[pid].determined)
+
+    def test_conflicting_readings_are_inconsistent(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        # A 点不守恒：P1=30 进，P3=10 + P2=25 出（35 != 30）
+        entries = [(pid, cap, 25 if pid == "P2" else r) for pid, cap, r in entries]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertFalse(result.consistent)
+        self.assertEqual(result.estimates, [])  # 不一致时不输出补值
+
+    def test_reading_beyond_capacity_is_inconsistent(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        # P1 读数 30 但容量只有 20
+        entries = [(pid, 20 if pid == "P1" else cap, r) for pid, cap, r in entries]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertFalse(result.consistent)
+
+    def test_total_injection_must_equal_total_withdrawal(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        # 注入 30、取用合计只有 20：无可行解
+        withdrawals = [("U1", 10), ("U2", 10), ("U3", 0)]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertFalse(result.consistent)
+
+    def test_stopped_source_must_inject_zero(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        nodes["S"] = Node("S", "source", running=False)
+        # 停运水源注入非零 -> 不一致
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertFalse(result.consistent)
+        # 停运水源零注入、全网零取用 -> 一致，缺报管段全部确定为 0
+        injections = [("S", 0)]
+        withdrawals = [("U1", 0), ("U2", 0), ("U3", 0)]
+        entries = [(pid, cap, None) for pid, cap, _r in entries]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        for e in result.estimates:
+            self.assertEqual((e.min_flow, e.max_flow), (0, 0), e.pipe_id)
+            self.assertTrue(e.determined)
+
+    def test_blocked_pipe_must_have_zero_flow(self):
+        nodes, pipes, injections, withdrawals, entries = build_metering_tree()
+        # P4 阻断（关阀/待修复故障）：读数非零 -> 不一致
+        result = reconcile_metering(
+            nodes, pipes, injections, withdrawals, entries,
+            blocked_pipe_ids=frozenset({"P4"}),
+        )
+        self.assertFalse(result.consistent)
+        # P4 缺报且下游取用为 0：P4 确定为 0，P6 也确定为 0
+        withdrawals = [("U1", 10), ("U2", 10), ("U3", 0)]
+        injections = [("S", 20)]
+        entries = [
+            ("P1", 100, 20),
+            ("P2", 100, 10),
+            ("P3", 100, 10),
+            ("P4", 100, None),
+            ("P5", 100, 10),
+            ("P6", 100, None),
+        ]
+        result = reconcile_metering(
+            nodes, pipes, injections, withdrawals, entries,
+            blocked_pipe_ids=frozenset({"P4"}),
+        )
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        self.assertEqual((estimates["P4"].min_flow, estimates["P4"].max_flow), (0, 0))
+        self.assertEqual((estimates["P6"].min_flow, estimates["P6"].max_flow), (0, 0))
+        self.assertTrue(estimates["P4"].determined)
+        self.assertTrue(estimates["P6"].determined)
+
+    def test_negative_reading_reverse_flow(self):
+        # 流向与导入方向相反：P1 定义为 J->S，实际水流 S->J，读数为负
+        nodes = {
+            "S": Node("S", "source"),
+            "J": Node("J", "junction"),
+            "U": Node("U", "sink"),
+        }
+        pipes = {
+            "P1": Pipe("P1", "J", "S"),
+            "P2": Pipe("P2", "J", "U"),
+        }
+        injections = [("S", 10)]
+        withdrawals = [("U", 10)]
+        # 读数 P1 = -10（J->S 为正，实际 S->J 10）
+        entries = [("P1", 100, -10), ("P2", 100, None)]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        self.assertEqual((estimates["P2"].min_flow, estimates["P2"].max_flow), (10, 10))
+        # 读数符号弄反（+10）则不守恒 -> 不一致
+        entries = [("P1", 100, 10), ("P2", 100, None)]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertFalse(result.consistent)
+
+    def test_ring_missing_readings_give_ranges(self):
+        nodes, pipes = build_metering_ring()
+        injections = [("S", 10)]
+        withdrawals = [("U", 10)]
+        entries = [("P1", 6, None), ("P2", 6, None), ("P3", 10, None)]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        # P3 最多 10 -> P1 = P2 >= 0；P1/P2 容量 6 -> P3 >= 4
+        self.assertEqual((estimates["P1"].min_flow, estimates["P1"].max_flow), (0, 6))
+        self.assertEqual((estimates["P2"].min_flow, estimates["P2"].max_flow), (0, 6))
+        self.assertEqual((estimates["P3"].min_flow, estimates["P3"].max_flow), (4, 10))
+        for e in result.estimates:
+            self.assertFalse(e.determined)
+
+    def test_ring_reading_pins_down_others(self):
+        nodes, pipes = build_metering_ring()
+        injections = [("S", 10)]
+        withdrawals = [("U", 10)]
+        # P2 读数 4 -> P1 = 4、P3 = 6 均可确定
+        entries = [("P1", 6, None), ("P2", 6, 4), ("P3", 10, None)]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        self.assertEqual((estimates["P1"].min_flow, estimates["P1"].max_flow), (4, 4))
+        self.assertEqual((estimates["P3"].min_flow, estimates["P3"].max_flow), (6, 6))
+        self.assertTrue(all(e.determined for e in result.estimates))
+
+    def test_ring_circulation_allows_negative_range(self):
+        nodes, pipes = build_metering_ring()
+        # 零注入零取用：环上可有环流，P1 ∈ [-6, 6]，P3 = -P1 受 P1 容量约束
+        injections = [("S", 0)]
+        withdrawals = [("U", 0)]
+        entries = [("P1", 6, None), ("P2", 6, None), ("P3", 10, None)]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        self.assertEqual((estimates["P1"].min_flow, estimates["P1"].max_flow), (-6, 6))
+        self.assertEqual((estimates["P2"].min_flow, estimates["P2"].max_flow), (-6, 6))
+        self.assertEqual((estimates["P3"].min_flow, estimates["P3"].max_flow), (-6, 6))
+
+    def test_zero_capacity_missing_pipe_is_zero(self):
+        nodes, pipes, _inj, _wd, _entries = build_metering_tree()
+        # P2 容量 0 且缺报 -> 下游 B 片区断流，取用必须为 0 才一致
+        injections = [("S", 10)]
+        withdrawals = [("U1", 10), ("U2", 0), ("U3", 0)]
+        entries = [
+            ("P1", 100, 10),
+            ("P2", 0, None),
+            ("P3", 100, 10),
+            ("P4", 100, 0),
+            ("P5", 100, 0),
+            ("P6", 100, 0),
+        ]
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        self.assertEqual((estimates["P2"].min_flow, estimates["P2"].max_flow), (0, 0))
+        self.assertTrue(estimates["P2"].determined)
+
+    def test_two_source_sharing_pipe_range(self):
+        # 双水源经联络点共同供水：S1 停运时只能 S2 顶供
+        nodes, pipes = build_two_source_demo()
+        injections = [("S1", 0), ("S2", 8)]
+        withdrawals = [("U1", 3), ("U2", 5)]
+        entries = [(pid, 100, None) for pid in pipes]
+        nodes["S1"] = Node("S1", "source", running=False)
+        result = reconcile_metering(nodes, pipes, injections, withdrawals, entries)
+        self.assertTrue(result.consistent)
+        estimates = _estimates_by_pipe(result)
+        # 树状结构：Q1=0（停运源零注入）、Q3=8、Q2=3、Q4=5 全部可确定
+        expected = {"Q1": 0, "Q3": 8, "Q2": 3, "Q4": 5}
+        for pid, flow in expected.items():
+            self.assertEqual(
+                (estimates[pid].min_flow, estimates[pid].max_flow), (flow, flow), pid
+            )
 
 
 if __name__ == "__main__":

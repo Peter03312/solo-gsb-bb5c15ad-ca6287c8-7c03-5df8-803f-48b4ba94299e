@@ -13,6 +13,7 @@
 - POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
+- POST /api/metering/reconcile                         流量计读数核对（只读：缺报管段的可推断流量范围）
 
 状态回看（快照）：
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
@@ -34,9 +35,11 @@ from .planning import (
     evaluate_plan,
     evaluate_restore,
     evaluate_source_switch,
+    reconcile_metering,
     recommend_plan,
     validate_delivery_request,
     validate_import,
+    validate_metering_request,
     BLOCKING_ISSUE_CODES,
 )
 from .schemas import (
@@ -46,6 +49,7 @@ from .schemas import (
     RestoreIn,
     SourceSwitchIn,
     DeliveryEvaluateIn,
+    MeteringReconcileIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -56,6 +60,7 @@ from .schemas import (
     SourceSwitchPreviewOut,
     SourceSwitchOut,
     DeliveryEvaluateOut,
+    MeteringReconcileOut,
     EventOut,
     SnapshotOut,
     SnapshotMetaOut,
@@ -67,6 +72,7 @@ from .serializers import (
     serialize_restore_preview,
     serialize_source_switch_preview,
     serialize_delivery,
+    serialize_metering,
     serialize_snapshot,
     serialize_snapshot_row,
     serialize_snapshot_diff,
@@ -525,6 +531,53 @@ def evaluate_delivery_request(payload: DeliveryEvaluateIn):
         blocked_pipe_ids=blocked_pipe_ids,
     )
     return serialize_delivery(version, payload.version, result)
+
+
+# ---------------------------------------------------------------- 流量计读数核对（只读）
+
+
+@app.post(
+    "/api/metering/reconcile",
+    response_model=MeteringReconcileOut,
+    tags=["流量核算"],
+    summary="流量计读数核对：按当前水源状态/关阀/故障核对读数，缺报管段给出可推断流量范围（只读）",
+)
+def reconcile_metering_request(payload: MeteringReconcileIn):
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        # 已关闭阀门与待修复故障管段流量必须为零：阻断口径与既有可达性接口完全一致
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    injections = [(s.source_id, s.injection) for s in payload.sources]
+    withdrawals = [(s.sink_id, s.withdrawal) for s in payload.sinks]
+    pipe_entries = [(p.pipe_id, p.capacity, p.reading) for p in payload.pipes]
+
+    issues = validate_metering_request(
+        nodes, pipes, injections, withdrawals, pipe_entries
+    )
+    if issues:
+        raise ApiError(
+            422,
+            "METERING_REQUEST_INVALID",
+            "流量计读数核对请求非法（编号未覆盖当前管网、同类重复或编号不存在）",
+            issues=issues,
+        )
+
+    blocked_pipe_ids = frozenset(
+        p.id for p in pipes.values() if p.has_valve and p.valve_closed
+    ) | pending_fault_ids
+
+    result = reconcile_metering(
+        nodes,
+        pipes,
+        injections,
+        withdrawals,
+        pipe_entries,
+        blocked_pipe_ids=blocked_pipe_ids,
+    )
+    return serialize_metering(version, payload.version, result)
 
 
 # ---------------------------------------------------------------- 状态快照回看

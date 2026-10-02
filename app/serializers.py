@@ -7,6 +7,7 @@ from .planning import (
     RestoreResult,
     SourceSwitchResult,
     DeliveryResult,
+    MeteringResult,
 )
 
 def serialize_node(node: Node) -> dict:
@@ -119,6 +120,28 @@ def serialize_delivery(
         "total_demand": result.total_demand,
         "max_delivered_total": result.max_delivered_total,
         "feasible": result.feasible,
+    }
+
+
+def serialize_metering(
+    version: int,
+    expected_version: int,
+    result: MeteringResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "consistent": result.consistent,
+        # 无可行解（不一致）时 result.estimates 恒为空，不输出任何补值
+        "estimates": [
+            {
+                "pipe_id": e.pipe_id,
+                "min_flow": e.min_flow,
+                "max_flow": e.max_flow,
+                "determined": e.determined,
+            }
+            for e in result.estimates
+        ],
     }
 
 

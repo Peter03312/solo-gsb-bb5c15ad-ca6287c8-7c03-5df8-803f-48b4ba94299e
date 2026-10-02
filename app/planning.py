@@ -41,6 +41,20 @@
 - 管段为双向共用输水上限：两方向净流量合计（即净流量绝对值）不得超过上限，
   按无向边容量建模；最大可交付总量 = 超级源→各水源→管网→各需求点→超级汇
   的整数最大流（对总需求封顶）。全部为整数容量，最大流为整数。
+
+流量计读数核对（metering）规则（只读，不改阀位/事件/版本/快照）：
+- 调度员携带已读版本、**每个水源**的实际注入量、**每个用水点**的实际取用量，
+  以及覆盖**全部管段**的双向共用容量与可为空（缺报）的带符号读数；
+  注入/取用/容量均为非负整数升/小时，读数以导入管段的 from→to 为正。
+- 水源、用水点、管段编号均须**完整覆盖当前管网**（不多不少）、同类不得重复；
+  编号覆盖不足、重复、未知节点整体拒绝（422）。
+- 按当前水源运行状态、关阀与待修复故障核对：停运水源注入必须为零；
+  阻断管段（已关阀门 ∪ 待修复故障）流量必须为零；每个节点满足
+  流入 + 注入 = 流出 + 取用；管段流量绝对值不超过容量。
+- 读数非空的管段流量固定为读数；缺报管段在全部可行解中求最小/最大流量，
+  二者相同即该管段流量可唯一确定；无可行解时整体不一致，不输出任何补值。
+- 约束矩阵为节点-弧关联矩阵（全单模）且边界均为整数，故每条缺报管段的
+  可行流量为连续整数区间，端点由带上下界可行流二分求得。
 """
 from __future__ import annotations
 
@@ -84,6 +98,17 @@ DELIVERY_SINK_NOT_FOUND = "DELIVERY_SINK_NOT_FOUND"  # 用水点编号不存在
 DELIVERY_SINK_NOT_SINK = "DELIVERY_SINK_NOT_SINK"  # 节点存在但不是用水点
 DELIVERY_SINK_DUPLICATE = "DELIVERY_SINK_DUPLICATE"  # 用水点编号重复
 DELIVERY_DEMANDS_EMPTY = "DELIVERY_DEMANDS_EMPTY"  # 用水点需求列表为空
+
+# 流量计读数核对请求问题
+METERING_SOURCE_NOT_FOUND = "METERING_SOURCE_NOT_FOUND"  # 水源编号在当前管网不存在
+METERING_SOURCE_MISSING = "METERING_SOURCE_MISSING"  # 当前管网水源未在请求中列出（未覆盖）
+METERING_SOURCE_DUPLICATE = "METERING_SOURCE_DUPLICATE"  # 水源编号重复
+METERING_SINK_NOT_FOUND = "METERING_SINK_NOT_FOUND"  # 用水点编号在当前管网不存在
+METERING_SINK_MISSING = "METERING_SINK_MISSING"  # 当前管网用水点未在请求中列出（未覆盖）
+METERING_SINK_DUPLICATE = "METERING_SINK_DUPLICATE"  # 用水点编号重复
+METERING_PIPE_NOT_FOUND = "METERING_PIPE_NOT_FOUND"  # 管段编号在当前管网不存在
+METERING_PIPE_MISSING = "METERING_PIPE_MISSING"  # 当前管网管段未在请求中列出（未覆盖）
+METERING_PIPE_DUPLICATE = "METERING_PIPE_DUPLICATE"  # 管段编号重复
 
 # 结构性阻断问题（预演会给出，提交据此拒绝）
 BLOCKING_ISSUE_CODES = frozenset(
@@ -888,71 +913,44 @@ def validate_delivery_request(
     return issues
 
 
-def _undirected_max_flow(
-    node_ids: list[str],
-    edges: list[tuple[str, str, int]],
-    sources: list[tuple[str, int]],
-    sinks: list[tuple[str, int]],
+def _max_flow_value(
+    node_count: int,
+    arcs: list[tuple[int, int, int]],
+    source: int,
+    sink: int,
 ) -> int:
-    """整数无向（双向共用容量）多源多汇最大流，Dinic 实现。
+    """有向整数最大流（Dinic）。节点为 0..node_count-1，arcs 为 (u, v, cap)。
 
-    - edges：(u, v, c)，无向边净流量 |f| <= c（两方向合计不得超过 c）。
-      残差网络中该边初始两个方向的剩余容量均为 c：向一个方向输水 d 后，
-      该方向剩余 c-d、反向剩余 c+d（c 为可回撤量、d 为换向余量），
-      天然保证任意时刻两方向净流量之和不超过 c。
-    - sources：(节点, 供水上限)；sinks：(节点, 需求上限)。
-    - 增加超级源/超级汇把多源多汇化为单源单汇；汇边容量为各点需求，
-      因而最大流天然对总需求封顶（其值即“可交付到这些需求点的最大总量”）。
-    所有容量均为非负整数，最大流值为整数。
+    cap <= 0 的弧忽略。所有容量为非负整数时最大流值为整数。
     """
-    index = {nid: i for i, nid in enumerate(node_ids)}
-    super_source = len(node_ids)
-    super_sink = super_source + 1
-    n = super_sink + 1
-
-    graph: list[list[list[int]]] = [[] for _ in range(n)]
-
-    def add_arc(u: int, v: int, cap: int) -> int:
-        graph[u].append([v, cap, len(graph[v])])
-        graph[v].append([u, 0, len(graph[u]) - 1])
-        return len(graph[u]) - 1
-
-    for u, v, cap in edges:
+    graph: list[list[list[int]]] = [[] for _ in range(node_count)]
+    for u, v, cap in arcs:
         if cap <= 0:
             continue
-        iu, iv = index[u], index[v]
-        # 无向边：两条相互独立的有向弧，初始容量均为 cap。
-        # 二者互为“输水余量 + 对向可回撤量”，见函数说明。
-        add_arc(iu, iv, cap)
-        add_arc(iv, iu, cap)
-    for nid, cap in sources:
-        if cap > 0:
-            add_arc(super_source, index[nid], cap)
-    for nid, cap in sinks:
-        if cap > 0:
-            add_arc(index[nid], super_sink, cap)
+        graph[u].append([v, cap, len(graph[v])])
+        graph[v].append([u, 0, len(graph[u]) - 1])
 
     total = 0
     # 图规模受管网节点数限制；提高递归上限，避免深链管网触发默认限制
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), n * 4 + 1000))
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), node_count * 4 + 1000))
     while True:
         # BFS 分层
-        level = [-1] * n
-        level[super_source] = 0
-        queue: deque[int] = deque([super_source])
+        level = [-1] * node_count
+        level[source] = 0
+        queue: deque[int] = deque([source])
         while queue:
             u = queue.popleft()
             for v, cap, rev in graph[u]:
                 if cap > 0 and level[v] < 0:
                     level[v] = level[u] + 1
                     queue.append(v)
-        if level[super_sink] < 0:
+        if level[sink] < 0:
             return total
 
-        cur = [0] * n
+        cur = [0] * node_count
 
         def dfs(u: int, pushed: int) -> int:
-            if u == super_sink:
+            if u == sink:
                 return pushed
             while cur[u] < len(graph[u]):
                 edge = graph[u][cur[u]]
@@ -967,10 +965,50 @@ def _undirected_max_flow(
             return 0
 
         while True:
-            pushed = dfs(super_source, 10**18)
+            pushed = dfs(source, 10**18)
             if not pushed:
                 break
             total += pushed
+
+
+def _undirected_max_flow(
+    node_ids: list[str],
+    edges: list[tuple[str, str, int]],
+    sources: list[tuple[str, int]],
+    sinks: list[tuple[str, int]],
+) -> int:
+    """整数无向（双向共用容量）多源多汇最大流。
+
+    - edges：(u, v, c)，无向边净流量 |f| <= c（两方向合计不得超过 c）。
+      残差网络中该边初始两个方向的剩余容量均为 c：向一个方向输水 d 后，
+      该方向剩余 c-d、反向剩余 c+d（c 为可回撤量、d 为换向余量），
+      天然保证任意时刻两方向净流量之和不超过 c。
+    - sources：(节点, 供水上限)；sinks：(节点, 需求上限)。
+    - 增加超级源/超级汇把多源多汇化为单源单汇；汇边容量为各点需求，
+      因而最大流天然对总需求封顶（其值即“可交付到这些需求点的最大总量”）。
+    所有容量均为非负整数，最大流值为整数。
+    """
+    index = {nid: i for i, nid in enumerate(node_ids)}
+    super_source = len(node_ids)
+    super_sink = super_source + 1
+
+    arcs: list[tuple[int, int, int]] = []
+    for u, v, cap in edges:
+        if cap <= 0:
+            continue
+        iu, iv = index[u], index[v]
+        # 无向边：两条相互独立的有向弧，初始容量均为 cap。
+        # 二者互为“输水余量 + 对向可回撤量”，见函数说明。
+        arcs.append((iu, iv, cap))
+        arcs.append((iv, iu, cap))
+    for nid, cap in sources:
+        if cap > 0:
+            arcs.append((super_source, index[nid], cap))
+    for nid, cap in sinks:
+        if cap > 0:
+            arcs.append((index[nid], super_sink, cap))
+
+    return _max_flow_value(super_sink + 1, arcs, super_source, super_sink)
 
 
 def evaluate_delivery(
@@ -1019,6 +1057,319 @@ def evaluate_delivery(
         max_delivered_total=max_delivered,
         feasible=max_delivered == total_demand,
     )
+
+
+# ---------------------------------------------------------------- 流量计读数核对
+
+
+@dataclass
+class MeteringEstimate:
+    """单条缺报管段的可推断流量范围（所有可行解中的最小/最大流量）。
+
+    符号约定与读数一致：以导入管段的 from→to 为正，单位升/小时。
+    min_flow == max_flow 时 determined=True，即该管段流量可被唯一确定。
+    """
+
+    pipe_id: str
+    min_flow: int
+    max_flow: int
+    determined: bool
+
+
+@dataclass
+class MeteringResult:
+    """流量计读数核对结果（只读计算，不改任何状态）。
+
+    - consistent：是否存在同时满足全部约束（停运水源零注入、阻断管段零流量、
+      逐节点流入+注入=流出+取用、|管段流量|≤容量、已上报读数固定）的可行解；
+      无可行解时为 False，且 estimates 为空（不输出任何补值）；
+    - estimates：每条缺报（读数为 null）管段在全部可行解中的最小/最大流量，
+      按管段编号排序；阻断管段缺报时流量恒为 0（min=max=0）。
+    """
+
+    consistent: bool
+    estimates: list[MeteringEstimate] = field(default_factory=list)
+    issues: list[Issue] = field(default_factory=list)
+
+
+def validate_metering_request(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    injections: list[tuple[str, int]],
+    withdrawals: list[tuple[str, int]],
+    pipe_entries: list[tuple[str, int, int | None]],
+) -> list[Issue]:
+    """校验流量计读数核对请求本身（结构 / 编号 / 覆盖 / 重复）。
+
+    - 水源、用水点、管段编号均须完整覆盖当前管网：存在性 + 无重复 + 无遗漏
+      （不多不少）；节点存在但类型不符（不是水源/用水点）同样视为不存在；
+    - 注入/取用/容量的非负整数约束由请求模型（pydantic）保证，此处不再重复。
+    """
+    issues: list[Issue] = []
+
+    network_source_ids = {nid for nid, n in nodes.items() if n.type == "source"}
+    seen_sources: set[str] = set()
+    for source_id, _injection in injections:
+        if source_id in seen_sources:
+            issues.append(
+                Issue(
+                    METERING_SOURCE_DUPLICATE,
+                    f"水源编号重复：{source_id}",
+                    source_id,
+                )
+            )
+            continue
+        seen_sources.add(source_id)
+        if source_id not in nodes or nodes[source_id].type != "source":
+            # 编号不存在或节点不是水源，均视为该水源不属于当前管网
+            issues.append(
+                Issue(
+                    METERING_SOURCE_NOT_FOUND,
+                    f"水源编号在当前管网不存在：{source_id}",
+                    source_id,
+                )
+            )
+    for missing in sorted(network_source_ids - seen_sources):
+        issues.append(
+            Issue(
+                METERING_SOURCE_MISSING,
+                f"当前管网水源未在请求中列出（注入量须覆盖全部水源）：{missing}",
+                missing,
+            )
+        )
+
+    network_sink_ids = {nid for nid, n in nodes.items() if n.type == "sink"}
+    seen_sinks: set[str] = set()
+    for sink_id, _withdrawal in withdrawals:
+        if sink_id in seen_sinks:
+            issues.append(
+                Issue(
+                    METERING_SINK_DUPLICATE,
+                    f"用水点编号重复：{sink_id}",
+                    sink_id,
+                )
+            )
+            continue
+        seen_sinks.add(sink_id)
+        if sink_id not in nodes or nodes[sink_id].type != "sink":
+            # 编号不存在或节点不是用水点，均视为该用水点不属于当前管网
+            issues.append(
+                Issue(
+                    METERING_SINK_NOT_FOUND,
+                    f"用水点编号在当前管网不存在：{sink_id}",
+                    sink_id,
+                )
+            )
+    for missing in sorted(network_sink_ids - seen_sinks):
+        issues.append(
+            Issue(
+                METERING_SINK_MISSING,
+                f"当前管网用水点未在请求中列出（取用量须覆盖全部用水点）：{missing}",
+                missing,
+            )
+        )
+
+    seen_pipes: set[str] = set()
+    for pipe_id, _capacity, _reading in pipe_entries:
+        if pipe_id in seen_pipes:
+            issues.append(
+                Issue(
+                    METERING_PIPE_DUPLICATE,
+                    f"管段编号重复：{pipe_id}",
+                    pipe_id,
+                )
+            )
+            continue
+        seen_pipes.add(pipe_id)
+        if pipe_id not in pipes:
+            issues.append(
+                Issue(
+                    METERING_PIPE_NOT_FOUND,
+                    f"管段编号在当前管网不存在：{pipe_id}",
+                    pipe_id,
+                )
+            )
+    for missing in sorted(set(pipes) - seen_pipes):
+        issues.append(
+            Issue(
+                METERING_PIPE_MISSING,
+                f"当前管网管段未在请求中列出（容量与读数须覆盖全部管段）：{missing}",
+                missing,
+            )
+        )
+    return issues
+
+
+def _feasible_bounded_flow(
+    node_ids: list[str],
+    balances: dict[str, int],
+    edges: list[tuple[str, str, int, int]],
+) -> bool:
+    """带上下界的节点平衡可行流判定（整数）。
+
+    - balances：{节点: 所需净流入}（取用 - 注入；连接点为 0），总和必须为 0；
+    - edges：(u, v, lo, hi)，流量以 u→v 为正，lo 可为负（允许反向流）。
+
+    经典降界变换：令 f = lo + g（0 ≤ g ≤ hi-lo），把 lo 计入节点平衡后，
+    以超级源/超级汇把“节点盈余/亏空”化为单源单汇最大流，
+    可行 ⟺ 最大流 == 总亏空。容量均为整数，存在整数可行流。
+    """
+    if sum(balances.values()) != 0:
+        return False
+    index = {nid: i for i, nid in enumerate(node_ids)}
+    super_source = len(node_ids)
+    super_sink = super_source + 1
+
+    adjusted = dict(balances)
+    arcs: list[tuple[int, int, int]] = []
+    for u, v, lo, hi in edges:
+        if lo:
+            # 下界流量 lo 已从 u 流向 v：u 需要等额净流入补偿，v 的亏空减少
+            adjusted[u] += lo
+            adjusted[v] -= lo
+        if hi > lo:
+            arcs.append((index[u], index[v], hi - lo))
+    total_demand = 0
+    for nid in node_ids:
+        need = adjusted[nid]
+        if need > 0:
+            arcs.append((index[nid], super_sink, need))
+            total_demand += need
+        elif need < 0:
+            arcs.append((super_source, index[nid], -need))
+    if total_demand == 0:
+        return True
+    return (
+        _max_flow_value(super_sink + 1, arcs, super_source, super_sink)
+        == total_demand
+    )
+
+
+def _edge_flow_range(
+    node_ids: list[str],
+    balances: dict[str, int],
+    edges: list[tuple[str, str, int, int]],
+    edge_index: int,
+) -> tuple[int, int]:
+    """求第 edge_index 条边在全部可行解中的最小/最大流量（前提：问题可行）。
+
+    可行域是节点-弧关联多面体（全单模）在单条边流量上的投影，为连续整数
+    区间，端点在整数处取得；因此对整数端点二分：
+    max = 最大的 k 使“流量 ≥ k”可行（k 越小越易满足），
+    min = 最小的 k 使“流量 ≤ k”可行（k 越大越易满足）。
+    """
+    u, v, lo, hi = edges[edge_index]
+
+    def feasible_with(new_lo: int, new_hi: int) -> bool:
+        trial = list(edges)
+        trial[edge_index] = (u, v, new_lo, new_hi)
+        return _feasible_bounded_flow(node_ids, balances, trial)
+
+    low, high = lo, hi
+    while low < high:
+        mid = (low + high + 1) // 2
+        if feasible_with(mid, hi):
+            low = mid
+        else:
+            high = mid - 1
+    max_flow = low
+
+    low, high = lo, hi
+    while low < high:
+        mid = (low + high) // 2
+        if feasible_with(lo, mid):
+            high = mid
+        else:
+            low = mid + 1
+    min_flow = low
+    return min_flow, max_flow
+
+
+def reconcile_metering(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    injections: list[tuple[str, int]],
+    withdrawals: list[tuple[str, int]],
+    pipe_entries: list[tuple[str, int, int | None]],
+    *,
+    blocked_pipe_ids: frozenset[str] = frozenset(),
+) -> MeteringResult:
+    """按当前水源运行状态、关阀与待修复故障核对一批流量计读数（只读）。
+
+    - injections / withdrawals：每个水源的实际注入量 / 每个用水点的实际取用量
+      （非负整数升/小时），调用方须先通过 validate_metering_request 结构校验；
+    - pipe_entries：(管段编号, 双向共用容量, 读数或 None)，覆盖全部管段；
+      读数以导入管段的 from→to 为正；
+    - blocked_pipe_ids：已关闭阀门与待修复故障管段，流量必须为零
+      （与可达性口径完全一致）；停运水源(running=False)注入必须为零。
+
+    返回每条缺报管段在全部可行解中的最小/最大流量；无可行解时
+    consistent=False 且不输出任何补值。
+    """
+    injection_map = dict(injections)
+    withdrawal_map = dict(withdrawals)
+
+    # 节点平衡：所需净流入 = 取用 - 注入（连接点恒为 0）
+    balances: dict[str, int] = {}
+    infeasible = False
+    for nid, node in nodes.items():
+        injection = injection_map.get(nid, 0) if node.type == "source" else 0
+        withdrawal = withdrawal_map.get(nid, 0) if node.type == "sink" else 0
+        if node.type == "source" and not node.running and injection != 0:
+            # 停运水源注入必须为零
+            infeasible = True
+        balances[nid] = withdrawal - injection
+
+    capacity_map = {pid: cap for pid, cap, _reading in pipe_entries}
+    reading_map = {pid: reading for pid, _cap, reading in pipe_entries}
+
+    # 每条管段的流量可行区间 [lo, hi]（读数固定、阻断归零、缺报取容量区间），
+    # 再与容量约束 [-cap, cap] 求交：读数绝对值超容量即无可行解
+    bounds: dict[str, tuple[int, int]] = {}
+    for pid in pipes:
+        cap = capacity_map[pid]
+        reading = reading_map[pid]
+        if pid in blocked_pipe_ids:
+            lo, hi = 0, 0
+        elif reading is not None:
+            lo = hi = reading
+        else:
+            lo, hi = -cap, cap
+        lo, hi = max(lo, -cap), min(hi, cap)
+        if lo > hi:
+            infeasible = True
+        bounds[pid] = (lo, hi)
+
+    node_ids = list(nodes.keys())
+    edges = [
+        (pipe.from_node, pipe.to_node, bounds[pipe.id][0], bounds[pipe.id][1])
+        for pipe in pipes.values()
+    ]
+
+    if infeasible or not _feasible_bounded_flow(node_ids, balances, edges):
+        return MeteringResult(consistent=False)
+
+    estimates: list[MeteringEstimate] = []
+    for edge_index, pipe in enumerate(pipes.values()):
+        if reading_map[pipe.id] is not None:
+            continue  # 已上报读数的管段无需补值
+        lo, hi = bounds[pipe.id]
+        if lo == hi:
+            min_flow = max_flow = lo
+        else:
+            min_flow, max_flow = _edge_flow_range(
+                node_ids, balances, edges, edge_index
+            )
+        estimates.append(
+            MeteringEstimate(
+                pipe_id=pipe.id,
+                min_flow=min_flow,
+                max_flow=max_flow,
+                determined=min_flow == max_flow,
+            )
+        )
+    estimates.sort(key=lambda e: e.pipe_id)
+    return MeteringResult(consistent=True, estimates=estimates)
 
 
 # ---------------------------------------------------------------- 状态快照
